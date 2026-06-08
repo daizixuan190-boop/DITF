@@ -29,6 +29,7 @@ def parse_args():
     parser.add_argument("--max_pairs_per_cat", type=int, default=0, help="Optional category-wise cap for quick diagnosis.")
     parser.add_argument("--tile_rows", type=int, default=32, help="Row chunk size for exact high-resolution cosine map evaluation.")
     parser.add_argument("--flush_every_pairs", type=int, default=10, help="Write partial outputs every N pairs.")
+    parser.add_argument("--device", type=str, default="cuda", help="Device for exact chunked matching, e.g. cuda or cpu.")
     return parser.parse_args()
 
 
@@ -126,9 +127,10 @@ def make_grid_for_output_window(
     y_end: int,
     out_h: int,
     out_w: int,
+    device: torch.device,
 ) -> torch.Tensor:
-    xs = torch.arange(x_start, x_end, dtype=torch.float32)
-    ys = torch.arange(y_start, y_end, dtype=torch.float32)
+    xs = torch.arange(x_start, x_end, dtype=torch.float32, device=device)
+    ys = torch.arange(y_start, y_end, dtype=torch.float32, device=device)
     grid_x = 2.0 * ((xs + 0.5) / out_w) - 1.0
     grid_y = 2.0 * ((ys + 0.5) / out_h) - 1.0
     mesh_y, mesh_x = torch.meshgrid(grid_y, grid_x, indexing="ij")
@@ -142,7 +144,7 @@ def sample_feature_at_pixel(
     out_h: int,
     out_w: int,
 ) -> torch.Tensor:
-    grid = make_grid_for_output_window(pixel_x, pixel_x + 1, pixel_y, pixel_y + 1, out_h, out_w)
+    grid = make_grid_for_output_window(pixel_x, pixel_x + 1, pixel_y, pixel_y + 1, out_h, out_w, feat.device)
     sampled = F.grid_sample(feat, grid, mode="bilinear", align_corners=False)
     return sampled[0, :, 0, 0]
 
@@ -159,7 +161,7 @@ def compute_exact_cos_map_hr(
     trg_feat = trg_feat.float()
     for y_start in range(0, out_h, tile_rows):
         y_end = min(y_start + tile_rows, out_h)
-        grid = make_grid_for_output_window(0, out_w, y_start, y_end, out_h, out_w)
+        grid = make_grid_for_output_window(0, out_w, y_start, y_end, out_h, out_w, trg_feat.device)
         tile_feat = F.grid_sample(trg_feat, grid, mode="bilinear", align_corners=False)
         tile_feat = F.normalize(tile_feat, dim=1)
         tile_sim = (tile_feat * src_vec).sum(dim=1)[0]
@@ -269,6 +271,8 @@ def write_summary_json(records: list[dict[str, Any]], summary_path: str):
 def main():
     args = parse_args()
     ensure_dir(args.output_dir)
+    device = torch.device(args.device if args.device == "cpu" or torch.cuda.is_available() else "cpu")
+    print(f"Using matching device: {device}")
 
     test_path = os.path.join(args.dataset_path, "PairAnnotation", "test")
     image_root = os.path.join(args.dataset_path, "JPEGImages")
@@ -321,6 +325,10 @@ def main():
                 args.discard_channels,
                 args.cd,
             )
+            src_ft_raw_dev = src_ft_raw_orig.float().to(device)
+            src_ft_ln_dev = src_ft_ln.float().to(device)
+            src_ft_post_dev = src_ft_post.float().to(device)
+            trg_ft_post_dev = trg_ft_post.float().to(device)
 
             src_img_size = data["src_imsize"][:2][::-1]
             trg_img_size = data["trg_imsize"][:2][::-1]
@@ -342,8 +350,8 @@ def main():
                 src_x, src_y = int(src_point[0]), int(src_point[1])
                 trg_x, trg_y = int(trg_point[0]), int(trg_point[1])
 
-                src_vec = sample_feature_at_pixel(src_ft_post.float(), src_x, src_y, src_eval_h, src_eval_w)
-                cos_map_hr = compute_exact_cos_map_hr(src_vec, trg_ft_post, trg_eval_h, trg_eval_w, args.tile_rows)
+                src_vec = sample_feature_at_pixel(src_ft_post_dev, src_x, src_y, src_eval_h, src_eval_w)
+                cos_map_hr = compute_exact_cos_map_hr(src_vec, trg_ft_post_dev, trg_eval_h, trg_eval_w, args.tile_rows)
                 flat_scores = cos_map_hr.view(-1).numpy()
                 topk = min(2, flat_scores.shape[0])
                 top2_idx = np.argpartition(flat_scores, -topk)[-topk:]
@@ -356,10 +364,10 @@ def main():
                 norm_dist = float(dist / max(threshold, 1e-6))
                 correct = int(norm_dist <= 0.1)
 
-                src_vec_raw = sample_feature_at_pixel(src_ft_raw_orig.float(), src_x, src_y, src_eval_h, src_eval_w)
-                src_vec_ln = sample_feature_at_pixel(src_ft_ln.float(), src_x, src_y, src_eval_h, src_eval_w)
+                src_vec_raw = sample_feature_at_pixel(src_ft_raw_dev, src_x, src_y, src_eval_h, src_eval_w)
+                src_vec_ln = sample_feature_at_pixel(src_ft_ln_dev, src_x, src_y, src_eval_h, src_eval_w)
                 src_vec_post = src_vec
-                trg_vec_post = sample_feature_at_pixel(trg_ft_post.float(), trg_x, trg_y, trg_eval_h, trg_eval_w)
+                trg_vec_post = sample_feature_at_pixel(trg_ft_post_dev, trg_x, trg_y, trg_eval_h, trg_eval_w)
 
                 record = {
                     "category": cat,
