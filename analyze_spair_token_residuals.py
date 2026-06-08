@@ -10,6 +10,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
+from tqdm import tqdm
 
 
 def parse_args():
@@ -27,6 +28,7 @@ def parse_args():
     parser.add_argument("--top_energy_k", type=int, default=32, help="Top-energy channels used to define feature concentration.")
     parser.add_argument("--max_pairs_per_cat", type=int, default=0, help="Optional category-wise cap for quick diagnosis.")
     parser.add_argument("--tile_rows", type=int, default=32, help="Row chunk size for exact high-resolution cosine map evaluation.")
+    parser.add_argument("--flush_every_pairs", type=int, default=10, help="Write partial outputs every N pairs.")
     return parser.parse_args()
 
 
@@ -228,6 +230,42 @@ def quartile_control_summary(records: list[dict[str, Any]], control_key: str, sc
     return results
 
 
+def write_records_csv(records: list[dict[str, Any]], csv_path: str):
+    if not records:
+        return
+    fieldnames = sorted({key for record in records for key in record.keys()})
+    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(records)
+
+
+def write_summary_json(records: list[dict[str, Any]], summary_path: str):
+    score_keys = [
+        "post_highscale_ratio_src",
+        "ln_highscale_ratio_src",
+        "post_topk_ratio_src",
+        "shift_ratio_src",
+        "pre_ma_ratio",
+    ]
+    summary = {
+        "num_points": len(records),
+        "overall_error_rate": float(1.0 - np.mean([r["correct"] for r in records])) if records else None,
+        "deciles": {},
+        "controls": {},
+    }
+    for score_key in score_keys:
+        summary["deciles"][score_key] = decile_summary(records, score_key)
+        summary["controls"][score_key] = {
+            "by_src_boundary_margin": quartile_control_summary(records, "src_boundary_margin", score_key),
+            "by_trg_boundary_margin": quartile_control_summary(records, "trg_boundary_margin", score_key),
+            "by_pair_displacement": quartile_control_summary(records, "pair_displacement", score_key),
+        }
+    with open(summary_path, "w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2, ensure_ascii=False)
+    return summary
+
+
 def main():
     args = parse_args()
     ensure_dir(args.output_dir)
@@ -243,6 +281,10 @@ def main():
 
     pre_norm = nn.LayerNorm(args.feature_dim, elementwise_affine=False, eps=1e-6)
     all_records: list[dict[str, Any]] = []
+    csv_path = os.path.join(args.output_dir, "per_point_records.csv")
+    summary_path = os.path.join(args.output_dir, "summary.json")
+    progress_path = os.path.join(args.output_dir, "progress.log")
+    processed_pairs = 0
 
     for cat in all_cats:
         feat_file = os.path.join(args.feature_path, f"{cat}.pth")
@@ -257,7 +299,8 @@ def main():
         if args.max_pairs_per_cat > 0:
             pair_names = pair_names[: args.max_pairs_per_cat]
 
-        for pair_name in pair_names:
+        print(f"[Category] {cat}: {len(pair_names)} pairs")
+        for pair_name in tqdm(pair_names, desc=f"{cat}", leave=False):
             with open(os.path.join(test_path, pair_name), "r", encoding="utf-8") as f:
                 data = json.load(f)
 
@@ -357,38 +400,20 @@ def main():
                 record.update(pair_scalars)
                 all_records.append(record)
 
-    csv_path = os.path.join(args.output_dir, "per_point_records.csv")
-    if all_records:
-        fieldnames = sorted({key for record in all_records for key in record.keys()})
-        with open(csv_path, "w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=fieldnames)
-            writer.writeheader()
-            writer.writerows(all_records)
+            processed_pairs += 1
+            if processed_pairs % args.flush_every_pairs == 0:
+                write_records_csv(all_records, csv_path)
+                summary = write_summary_json(all_records, summary_path)
+                with open(progress_path, "a", encoding="utf-8") as f:
+                    f.write(
+                        f"processed_pairs={processed_pairs}, num_points={summary['num_points']}, overall_error_rate={summary['overall_error_rate']}\n"
+                    )
+                print(
+                    f"[Flush] pairs={processed_pairs} points={summary['num_points']} overall_error_rate={summary['overall_error_rate']}"
+                )
 
-    score_keys = [
-        "post_highscale_ratio_src",
-        "ln_highscale_ratio_src",
-        "post_topk_ratio_src",
-        "shift_ratio_src",
-        "pre_ma_ratio",
-    ]
-    summary = {
-        "num_points": len(all_records),
-        "overall_error_rate": float(1.0 - np.mean([r["correct"] for r in all_records])) if all_records else None,
-        "deciles": {},
-        "controls": {},
-    }
-    for score_key in score_keys:
-        summary["deciles"][score_key] = decile_summary(all_records, score_key)
-        summary["controls"][score_key] = {
-            "by_src_boundary_margin": quartile_control_summary(all_records, "src_boundary_margin", score_key),
-            "by_trg_boundary_margin": quartile_control_summary(all_records, "trg_boundary_margin", score_key),
-            "by_pair_displacement": quartile_control_summary(all_records, "pair_displacement", score_key),
-        }
-
-    summary_path = os.path.join(args.output_dir, "summary.json")
-    with open(summary_path, "w", encoding="utf-8") as f:
-        json.dump(summary, f, indent=2, ensure_ascii=False)
+    write_records_csv(all_records, csv_path)
+    summary = write_summary_json(all_records, summary_path)
 
     print(f"Saved per-point records to: {csv_path}")
     print(f"Saved summary to: {summary_path}")
