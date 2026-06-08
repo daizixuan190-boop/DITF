@@ -8,6 +8,7 @@ from typing import Any
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from einops import rearrange
 
 
@@ -25,6 +26,7 @@ def parse_args():
     parser.add_argument("--top_scale_k", type=int, default=64, help="Top-|scale| channels used to define residual scale load.")
     parser.add_argument("--top_energy_k", type=int, default=32, help="Top-energy channels used to define feature concentration.")
     parser.add_argument("--max_pairs_per_cat", type=int, default=0, help="Optional category-wise cap for quick diagnosis.")
+    parser.add_argument("--tile_rows", type=int, default=32, help="Row chunk size for exact high-resolution cosine map evaluation.")
     return parser.parse_args()
 
 
@@ -113,6 +115,54 @@ def map_pixel_to_feature_index(pixel_x: int, pixel_y: int, eval_h: int, eval_w: 
     feat_x = min(max(feat_x, 0), feat_w - 1)
     feat_y = min(max(feat_y, 0), feat_h - 1)
     return feat_x, feat_y
+
+
+def make_grid_for_output_window(
+    x_start: int,
+    x_end: int,
+    y_start: int,
+    y_end: int,
+    out_h: int,
+    out_w: int,
+) -> torch.Tensor:
+    xs = torch.arange(x_start, x_end, dtype=torch.float32)
+    ys = torch.arange(y_start, y_end, dtype=torch.float32)
+    grid_x = 2.0 * ((xs + 0.5) / out_w) - 1.0
+    grid_y = 2.0 * ((ys + 0.5) / out_h) - 1.0
+    mesh_y, mesh_x = torch.meshgrid(grid_y, grid_x, indexing="ij")
+    return torch.stack((mesh_x, mesh_y), dim=-1).unsqueeze(0)
+
+
+def sample_feature_at_pixel(
+    feat: torch.Tensor,
+    pixel_x: int,
+    pixel_y: int,
+    out_h: int,
+    out_w: int,
+) -> torch.Tensor:
+    grid = make_grid_for_output_window(pixel_x, pixel_x + 1, pixel_y, pixel_y + 1, out_h, out_w)
+    sampled = F.grid_sample(feat, grid, mode="bilinear", align_corners=False)
+    return sampled[0, :, 0, 0]
+
+
+def compute_exact_cos_map_hr(
+    src_vec: torch.Tensor,
+    trg_feat: torch.Tensor,
+    out_h: int,
+    out_w: int,
+    tile_rows: int,
+) -> torch.Tensor:
+    src_vec = F.normalize(src_vec.view(1, -1), dim=1).view(1, -1, 1, 1)
+    cos_map = torch.empty((out_h, out_w), dtype=torch.float32)
+    trg_feat = trg_feat.float()
+    for y_start in range(0, out_h, tile_rows):
+        y_end = min(y_start + tile_rows, out_h)
+        grid = make_grid_for_output_window(0, out_w, y_start, y_end, out_h, out_w)
+        tile_feat = F.grid_sample(trg_feat, grid, mode="bilinear", align_corners=False)
+        tile_feat = F.normalize(tile_feat, dim=1)
+        tile_sim = (tile_feat * src_vec).sum(dim=1)[0]
+        cos_map[y_start:y_end, :] = tile_sim.cpu()
+    return cos_map
 
 
 def get_pair_scalar_fields(data: dict[str, Any]) -> dict[str, Any]:
@@ -234,8 +284,6 @@ def main():
 
             src_eval_h, src_eval_w = src_img_size
             trg_eval_h, trg_eval_w = trg_img_size
-            src_feat_h, src_feat_w = src_ft_post.shape[-2], src_ft_post.shape[-1]
-            trg_feat_h, trg_feat_w = trg_ft_post.shape[-2], trg_ft_post.shape[-1]
 
             trg_bndbox = data["trg_bndbox"]
             src_bndbox = data["src_bndbox"]
@@ -251,42 +299,24 @@ def main():
                 src_x, src_y = int(src_point[0]), int(src_point[1])
                 trg_x, trg_y = int(trg_point[0]), int(trg_point[1])
 
-                src_feat_x, src_feat_y = map_pixel_to_feature_index(
-                    src_x, src_y, src_eval_h, src_eval_w, src_feat_h, src_feat_w
-                )
-                trg_feat_x, trg_feat_y = map_pixel_to_feature_index(
-                    trg_x, trg_y, trg_eval_h, trg_eval_w, trg_feat_h, trg_feat_w
-                )
-
-                src_vec = src_ft_post[0, :, src_feat_y, src_feat_x].float()
-                trg_mat = rearrange(trg_ft_post[0].float(), "c h w -> (h w) c")
-                src_vec_norm = torch.nn.functional.normalize(src_vec.view(1, -1), dim=1).t()
-                trg_mat_norm = torch.nn.functional.normalize(trg_mat, dim=1)
-
-                cos_map_lr = torch.mm(trg_mat_norm, src_vec_norm).view(trg_feat_h, trg_feat_w)
-                flat_scores = cos_map_lr.view(-1).cpu().numpy()
+                src_vec = sample_feature_at_pixel(src_ft_post.float(), src_x, src_y, src_eval_h, src_eval_w)
+                cos_map_hr = compute_exact_cos_map_hr(src_vec, trg_ft_post, trg_eval_h, trg_eval_w, args.tile_rows)
+                flat_scores = cos_map_hr.view(-1).numpy()
                 topk = min(2, flat_scores.shape[0])
                 top2_idx = np.argpartition(flat_scores, -topk)[-topk:]
                 top2_scores = np.sort(flat_scores[top2_idx])[::-1]
                 top1_score = float(top2_scores[0])
                 top2_score = float(top2_scores[1]) if len(top2_scores) > 1 else float(top2_scores[0])
-
-                cos_map_hr = torch.nn.functional.interpolate(
-                    cos_map_lr.unsqueeze(0).unsqueeze(0),
-                    size=(trg_eval_h, trg_eval_w),
-                    mode="bilinear",
-                    align_corners=False,
-                )[0, 0].cpu().numpy()
-                pred_y, pred_x = np.unravel_index(int(cos_map_hr.argmax()), cos_map_hr.shape)
+                pred_y, pred_x = np.unravel_index(int(flat_scores.argmax()), cos_map_hr.shape)
 
                 dist = math.sqrt((pred_x - trg_x) ** 2 + (pred_y - trg_y) ** 2)
                 norm_dist = float(dist / max(threshold, 1e-6))
                 correct = int(norm_dist <= 0.1)
 
-                src_vec_raw = src_ft_raw_orig[0, :, src_feat_y, src_feat_x]
-                src_vec_ln = src_ft_ln[0, :, src_feat_y, src_feat_x]
-                src_vec_post = src_ft_post[0, :, src_feat_y, src_feat_x]
-                trg_vec_post = trg_ft_post[0, :, trg_feat_y, trg_feat_x]
+                src_vec_raw = sample_feature_at_pixel(src_ft_raw_orig.float(), src_x, src_y, src_eval_h, src_eval_w)
+                src_vec_ln = sample_feature_at_pixel(src_ft_ln.float(), src_x, src_y, src_eval_h, src_eval_w)
+                src_vec_post = src_vec
+                trg_vec_post = sample_feature_at_pixel(trg_ft_post.float(), trg_x, trg_y, trg_eval_h, trg_eval_w)
 
                 record = {
                     "category": cat,
