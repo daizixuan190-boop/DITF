@@ -200,8 +200,8 @@ def main():
         if not os.path.exists(feat_file) or not os.path.exists(ada_file):
             continue
 
-        output_dict = torch.load(feat_file, map_location="cpu")
-        ada_dict = torch.load(ada_file, map_location="cpu")
+        output_dict = torch.load(feat_file, map_location="cpu", weights_only=True)
+        ada_dict = torch.load(ada_file, map_location="cpu", weights_only=True)
 
         pair_names = cat2json[cat]
         if args.max_pairs_per_cat > 0:
@@ -232,11 +232,11 @@ def main():
             src_img_size = data["src_imsize"][:2][::-1]
             trg_img_size = data["trg_imsize"][:2][::-1]
 
-            src_ft_eval = nn.Upsample(size=src_img_size, mode="bilinear")(src_ft_post).float()
-            trg_ft_eval = nn.Upsample(size=trg_img_size, mode="bilinear")(trg_ft_post).float()
+            src_eval_h, src_eval_w = src_img_size
+            trg_eval_h, trg_eval_w = trg_img_size
+            src_feat_h, src_feat_w = src_ft_post.shape[-2], src_ft_post.shape[-1]
+            trg_feat_h, trg_feat_w = trg_ft_post.shape[-2], trg_ft_post.shape[-1]
 
-            trg_h = trg_ft_eval.shape[-2]
-            trg_w = trg_ft_eval.shape[-1]
             trg_bndbox = data["trg_bndbox"]
             src_bndbox = data["src_bndbox"]
             threshold = max(trg_bndbox[3] - trg_bndbox[1], trg_bndbox[2] - trg_bndbox[0])
@@ -251,30 +251,37 @@ def main():
                 src_x, src_y = int(src_point[0]), int(src_point[1])
                 trg_x, trg_y = int(trg_point[0]), int(trg_point[1])
 
-                src_vec = src_ft_eval[0, :, src_y, src_x]
-                trg_mat = rearrange(trg_ft_eval[0], "c h w -> (h w) c")
+                src_feat_x, src_feat_y = map_pixel_to_feature_index(
+                    src_x, src_y, src_eval_h, src_eval_w, src_feat_h, src_feat_w
+                )
+                trg_feat_x, trg_feat_y = map_pixel_to_feature_index(
+                    trg_x, trg_y, trg_eval_h, trg_eval_w, trg_feat_h, trg_feat_w
+                )
+
+                src_vec = src_ft_post[0, :, src_feat_y, src_feat_x].float()
+                trg_mat = rearrange(trg_ft_post[0].float(), "c h w -> (h w) c")
                 src_vec_norm = torch.nn.functional.normalize(src_vec.view(1, -1), dim=1).t()
                 trg_mat_norm = torch.nn.functional.normalize(trg_mat, dim=1)
 
-                cos_map = torch.mm(trg_mat_norm, src_vec_norm).view(trg_h, trg_w).cpu().numpy()
-                flat_scores = cos_map.reshape(-1)
+                cos_map_lr = torch.mm(trg_mat_norm, src_vec_norm).view(trg_feat_h, trg_feat_w)
+                flat_scores = cos_map_lr.view(-1).cpu().numpy()
                 topk = min(2, flat_scores.shape[0])
                 top2_idx = np.argpartition(flat_scores, -topk)[-topk:]
                 top2_scores = np.sort(flat_scores[top2_idx])[::-1]
                 top1_score = float(top2_scores[0])
                 top2_score = float(top2_scores[1]) if len(top2_scores) > 1 else float(top2_scores[0])
-                pred_y, pred_x = np.unravel_index(int(flat_scores.argmax()), cos_map.shape)
+
+                cos_map_hr = torch.nn.functional.interpolate(
+                    cos_map_lr.unsqueeze(0).unsqueeze(0),
+                    size=(trg_eval_h, trg_eval_w),
+                    mode="bilinear",
+                    align_corners=False,
+                )[0, 0].cpu().numpy()
+                pred_y, pred_x = np.unravel_index(int(cos_map_hr.argmax()), cos_map_hr.shape)
 
                 dist = math.sqrt((pred_x - trg_x) ** 2 + (pred_y - trg_y) ** 2)
                 norm_dist = float(dist / max(threshold, 1e-6))
                 correct = int(norm_dist <= 0.1)
-
-                src_feat_x, src_feat_y = map_pixel_to_feature_index(
-                    src_x, src_y, src_ft_eval.shape[-2], src_ft_eval.shape[-1], src_ft_post.shape[-2], src_ft_post.shape[-1]
-                )
-                trg_feat_x, trg_feat_y = map_pixel_to_feature_index(
-                    trg_x, trg_y, trg_ft_eval.shape[-2], trg_ft_eval.shape[-1], trg_ft_post.shape[-2], trg_ft_post.shape[-1]
-                )
 
                 src_vec_raw = src_ft_raw_orig[0, :, src_feat_y, src_feat_x]
                 src_vec_ln = src_ft_ln[0, :, src_feat_y, src_feat_x]
