@@ -43,7 +43,7 @@ configs = {
         repo_id="black-forest-labs/FLUX.1-dev",
         repo_flow="flux1-dev.safetensors",
         repo_ae="ae.safetensors",
-        ckpt_path="/mnt/sda/chaofan/hg_models/FLUX.1-dev/flux1-dev.safetensors",
+        ckpt_path="/root/autodl-tmp/hf_models/FLUX.1-dev/flux1-dev.safetensors",
         params=FluxParams(
             in_channels=64,
             vec_in_dim=768,
@@ -58,7 +58,7 @@ configs = {
             qkv_bias=True,
             guidance_embed=True,
         ),
-        ae_path="/mnt/sda/chaofan/hg_models/FLUX.1-dev/ae.safetensors",
+        ae_path="/root/autodl-tmp/hf_models/FLUX.1-dev/ae.safetensors",
         ae_params=AutoEncoderParams(
             resolution=256,
             in_channels=3,
@@ -143,11 +143,11 @@ def load_flow_model(name: str, device: str | torch.device = "cuda", hf_download:
 
 def load_t5(device: str | torch.device = "cuda", max_length: int = 512) -> HFEmbedder:
     # max length 64, 128, 256 and 512 should work (if your sequence is short enough)
-    return HFEmbedder("/mnt/nvme0n1/chaofan/hg_models/t5-v1_1-xxl", max_length=max_length, torch_dtype=torch.bfloat16).to(device)
+    return HFEmbedder("/root/autodl-tmp/hf_models/t5-v1_1-xxl", max_length=max_length, torch_dtype=torch.bfloat16).to(device)
 
 
 def load_clip(device: str | torch.device = "cuda") -> HFEmbedder:
-    return HFEmbedder("/mnt/sda/chaofan/hg_models/clip-vit-large-patch14", max_length=77, torch_dtype=torch.bfloat16).to(device)
+    return HFEmbedder("/root/autodl-tmp/hf_models/clip-vit-large-patch14", max_length=77, torch_dtype=torch.bfloat16).to(device)
 
 
 def load_ae(name: str, device: str | torch.device = "cuda", hf_download: bool = True) -> AutoEncoder:
@@ -653,3 +653,5 @@ def add_config_paths(data_path, config):
     config['grid_occlusions_dir'] = os.path.join(data_path, "grid_occlusions")
     config['model_vis_dir'] = os.path.join(data_path, "visualizations")
     return config
+configs["flux-dev"].ckpt_path = "/root/autodl-tmp/hf_models/FLUX.1-dev/flux1-dev.safetensors"
+configs["flux-dev"].ae_path = "/root/autodl-tmp/hf_models/FLUX.1-dev/ae.safetensors"

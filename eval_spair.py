@@ -5,6 +5,7 @@ from tqdm import tqdm
 import numpy as np
 from src.flux.feat_flux import Featurizer4Eval
 import os
+import gc
 import json
 from PIL import Image
 import torch.nn as nn
@@ -104,6 +105,10 @@ def main(args):
         torch.save(output_dict, os.path.join(args.save_path, f'{cat}.pth'))
         torch.save(ada_dict, os.path.join(args.save_path, f'{cat}_ada.pth'))
     
+    del dit_model
+    gc.collect()
+    torch.cuda.empty_cache()
+
     total_pck = []
     all_correct = 0
     all_total = 0
