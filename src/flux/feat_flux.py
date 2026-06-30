@@ -65,8 +65,8 @@ class Featurizer4Eval(Featurizer):
         self.null_prompt = null_prompt
         self.model = None
         self.ae = None
-        self.t5 = None
-        self.clip = None
+        self.t5 = load_t5("cpu", max_length=512)
+        self.clip = load_clip("cpu")
 
         if cat_list is None:
             cat_list = []
@@ -77,29 +77,23 @@ class Featurizer4Eval(Featurizer):
         prompts = {cat: f"a photo of a {cat}" for cat in cat_list}
 
         print("Init T5 prompt cache")
-        t5 = load_t5(device, max_length=512)
         cat2txt = {}
         with torch.no_grad():
             for cat, prompt in prompts.items():
-                txt = t5([prompt])
+                txt = self.t5([prompt])
                 if txt.shape[0] == 1 and ensemble_size > 1:
                     txt = repeat(txt, "1 ... -> bs ...", bs=ensemble_size)
                 txt_ids = torch.zeros(ensemble_size, txt.shape[1], 3, dtype=txt.dtype, device=txt.device)
                 cat2txt[cat] = (txt.cpu(), txt_ids.cpu())
-        del t5
-        gc.collect()
-        torch.cuda.empty_cache()
 
         print("Init CLIP prompt cache")
-        clip = load_clip(device)
         cat2vec = {}
         with torch.no_grad():
             for cat, prompt in prompts.items():
-                vec = clip([prompt])
+                vec = self.clip([prompt])
                 if vec.shape[0] == 1 and ensemble_size > 1:
                     vec = repeat(vec, "1 ... -> bs ...", bs=ensemble_size)
                 cat2vec[cat] = vec.cpu()
-        del clip
         gc.collect()
         torch.cuda.empty_cache()
 
@@ -133,11 +127,21 @@ class Featurizer4Eval(Featurizer):
         img_tensor = img_tensor.unsqueeze(0).repeat(ensemble_size, 1, 1, 1)
         img_tensor_ae = img_tensor.to("cpu", dtype=ae_dtype)
 
-        key = category if category in self.cat2prompt_embeds else "image"
-        prompt_embeds, text_ids, vec = self.cat2prompt_embeds[key]
-        prompt_embeds = prompt_embeds.to(self.device, dtype=torch.bfloat16, non_blocking=True)
-        text_ids = text_ids.to(self.device, dtype=torch.bfloat16, non_blocking=True)
-        vec = vec.to(self.device, dtype=torch.bfloat16, non_blocking=True)
+        use_cached_prompt = caption == "a photo of a image"
+        if use_cached_prompt:
+            key = category if category in self.cat2prompt_embeds else "image"
+            prompt_embeds, text_ids, vec = self.cat2prompt_embeds[key]
+            prompt_embeds = prompt_embeds.to(self.device, dtype=torch.bfloat16, non_blocking=True)
+            text_ids = text_ids.to(self.device, dtype=torch.bfloat16, non_blocking=True)
+            vec = vec.to(self.device, dtype=torch.bfloat16, non_blocking=True)
+        else:
+            prompt_embeds, text_ids, vec = prepare_txt(
+                bs=ensemble_size,
+                t5=self.t5,
+                clip=self.clip,
+                prompt=caption,
+                device=self.device,
+            )
 
         device = self.device
         t = timestep / 1000
