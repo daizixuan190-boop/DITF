@@ -264,13 +264,9 @@ def main(args):
     result['point']["Mean"] = round(mean_point_sum / len(all_cats), 2)
     
     
-    # 判断目录是否存在
-    save_dir = 'results_spair/%s'%args.dit_model
-    if not os.path.exists(save_dir):
-        # 如果目录不存在，则创建它
-        os.makedirs(save_dir)
-    # print(result)
-    with open('layers_cat/%s/t%s_b%s_e%s.json'%(args.dit_model, args.t, args.k, args.ensemble_size), 'w+') as json_file:
+    save_dir = os.path.join("layers_cat", args.dit_model)
+    os.makedirs(save_dir, exist_ok=True)
+    with open(os.path.join(save_dir, 't%s_b%s_e%s.json' % (args.t, args.k, args.ensemble_size)), 'w+') as json_file:
         json.dump(result, json_file, indent=4, ensure_ascii=False)
 
 
