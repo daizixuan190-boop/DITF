@@ -12,6 +12,20 @@ import torch.nn.functional as F
 from einops import rearrange
 from tqdm import tqdm
 
+SCORE_KEYS = [
+    "post_highscale_ratio_src",
+    "ln_highscale_ratio_src",
+    "post_topk_ratio_src",
+    "shift_ratio_src",
+    "pre_ma_ratio",
+]
+
+CONTROL_KEYS = [
+    "src_boundary_margin",
+    "trg_boundary_margin",
+    "pair_displacement",
+]
+
 
 def parse_args():
     parser = argparse.ArgumentParser(
@@ -242,27 +256,66 @@ def write_records_csv(records: list[dict[str, Any]], csv_path: str):
         writer.writerows(records)
 
 
-def write_summary_json(records: list[dict[str, Any]], summary_path: str):
-    score_keys = [
-        "post_highscale_ratio_src",
-        "ln_highscale_ratio_src",
-        "post_topk_ratio_src",
-        "shift_ratio_src",
-        "pre_ma_ratio",
-    ]
+def build_metric_summary(records: list[dict[str, Any]], count_key: str):
     summary = {
-        "num_points": len(records),
+        count_key: len(records),
         "overall_error_rate": float(1.0 - np.mean([r["correct"] for r in records])) if records else None,
         "deciles": {},
         "controls": {},
     }
-    for score_key in score_keys:
+    for score_key in SCORE_KEYS:
         summary["deciles"][score_key] = decile_summary(records, score_key)
         summary["controls"][score_key] = {
             "by_src_boundary_margin": quartile_control_summary(records, "src_boundary_margin", score_key),
             "by_trg_boundary_margin": quartile_control_summary(records, "trg_boundary_margin", score_key),
             "by_pair_displacement": quartile_control_summary(records, "pair_displacement", score_key),
         }
+    return summary
+
+
+def aggregate_records(records: list[dict[str, Any]], group_keys: list[str]) -> list[dict[str, Any]]:
+    grouped: dict[tuple[Any, ...], list[dict[str, Any]]] = {}
+    for record in records:
+        group_id = tuple(record[key] for key in group_keys)
+        grouped.setdefault(group_id, []).append(record)
+
+    aggregated = []
+    for group_id, subset in grouped.items():
+        agg_record: dict[str, Any] = {}
+        for key, value in zip(group_keys, group_id):
+            agg_record[key] = value
+        agg_record["count_points"] = len(subset)
+
+        numeric_keys = sorted(
+            {
+                key
+                for record in subset
+                for key, value in record.items()
+                if isinstance(value, (int, float)) and key not in group_keys
+            }
+        )
+        for key in numeric_keys:
+            agg_record[key] = float(np.mean([float(record[key]) for record in subset]))
+
+        for key, value in subset[0].items():
+            if key in agg_record:
+                continue
+            if isinstance(value, str) and all(record.get(key) == value for record in subset):
+                agg_record[key] = value
+
+        aggregated.append(agg_record)
+    return aggregated
+
+
+def write_summary_json(records: list[dict[str, Any]], summary_path: str):
+    pair_records = aggregate_records(records, ["category", "pair_name"])
+    src_image_records = aggregate_records(records, ["category", "src_imname"])
+
+    summary = build_metric_summary(records, "num_points")
+    summary["aggregates"] = {
+        "per_pair": build_metric_summary(pair_records, "num_pairs"),
+        "per_src_image": build_metric_summary(src_image_records, "num_src_images"),
+    }
     with open(summary_path, "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2, ensure_ascii=False)
     return summary
@@ -286,6 +339,8 @@ def main():
     pre_norm = nn.LayerNorm(args.feature_dim, elementwise_affine=False, eps=1e-6)
     all_records: list[dict[str, Any]] = []
     csv_path = os.path.join(args.output_dir, "per_point_records.csv")
+    pair_csv_path = os.path.join(args.output_dir, "per_pair_records.csv")
+    src_image_csv_path = os.path.join(args.output_dir, "per_src_image_records.csv")
     summary_path = os.path.join(args.output_dir, "summary.json")
     progress_path = os.path.join(args.output_dir, "progress.log")
     processed_pairs = 0
@@ -421,9 +476,13 @@ def main():
                 )
 
     write_records_csv(all_records, csv_path)
+    write_records_csv(aggregate_records(all_records, ["category", "pair_name"]), pair_csv_path)
+    write_records_csv(aggregate_records(all_records, ["category", "src_imname"]), src_image_csv_path)
     summary = write_summary_json(all_records, summary_path)
 
     print(f"Saved per-point records to: {csv_path}")
+    print(f"Saved per-pair records to: {pair_csv_path}")
+    print(f"Saved per-src-image records to: {src_image_csv_path}")
     print(f"Saved summary to: {summary_path}")
     print(f"Num points: {summary['num_points']}")
     print(f"Overall error rate: {summary['overall_error_rate']}")
