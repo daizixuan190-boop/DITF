@@ -13,6 +13,8 @@ from einops import rearrange
 from tqdm import tqdm
 
 SCORE_KEYS = [
+    "content_ratio_src",
+    "interaction_ratio_src",
     "post_highscale_ratio_src",
     "ln_highscale_ratio_src",
     "post_topk_ratio_src",
@@ -102,6 +104,18 @@ def topk_energy_ratio(vec: torch.Tensor, k: int) -> float:
     k = min(k, energy.numel())
     topk = torch.topk(energy, k=k).values.sum().item()
     return float(topk / total)
+
+
+def decompose_post_ratios(content_vec: torch.Tensor, shift_vec: torch.Tensor, post_vec: torch.Tensor) -> dict[str, float]:
+    post_energy = max(torch.sum(post_vec.float() ** 2).item(), 1e-6)
+    content_energy = torch.sum(content_vec.float() ** 2).item()
+    shift_energy = torch.sum(shift_vec.float() ** 2).item()
+    interaction_energy = 2.0 * torch.sum(content_vec.float() * shift_vec.float()).item()
+    return {
+        "content_ratio": float(content_energy / post_energy),
+        "shift_ratio": float(shift_energy / post_energy),
+        "interaction_ratio": float(interaction_energy / post_energy),
+    }
 
 
 def entropy_from_scores(scores: np.ndarray, temperature: float = 0.05) -> float:
@@ -423,6 +437,12 @@ def main():
                 src_vec_ln = sample_feature_at_pixel(src_ft_ln_dev, src_x, src_y, src_eval_h, src_eval_w)
                 src_vec_post = src_vec
                 trg_vec_post = sample_feature_at_pixel(trg_ft_post_dev, trg_x, trg_y, trg_eval_h, trg_eval_w)
+                src_shift_vec = src_shift[0, :, 0, 0].float().to(device)
+                trg_shift_vec = trg_shift[0, :, 0, 0].float().to(device)
+                src_content_vec = src_vec_post.float() - src_shift_vec
+                trg_content_vec = trg_vec_post.float() - trg_shift_vec
+                src_post_terms = decompose_post_ratios(src_content_vec, src_shift_vec, src_vec_post.float())
+                trg_post_terms = decompose_post_ratios(trg_content_vec, trg_shift_vec, trg_vec_post.float())
 
                 record = {
                     "category": cat,
@@ -446,19 +466,17 @@ def main():
                     "trg_boundary_margin": bbox_margin([trg_x, trg_y], trg_bndbox, threshold),
                     "pair_displacement": normalized_displacement([src_x, src_y], [trg_x, trg_y], threshold),
                     "pre_ma_ratio": safe_energy_ratio(src_vec_raw, args.discard_channels),
+                    "content_ratio_src": src_post_terms["content_ratio"],
+                    "content_ratio_trg": trg_post_terms["content_ratio"],
+                    "interaction_ratio_src": src_post_terms["interaction_ratio"],
+                    "interaction_ratio_trg": trg_post_terms["interaction_ratio"],
                     "post_highscale_ratio_src": safe_energy_ratio(src_vec_post, top_scale_src),
                     "post_highscale_ratio_trg": safe_energy_ratio(trg_vec_post, top_scale_trg),
                     "ln_highscale_ratio_src": safe_energy_ratio(src_vec_ln, top_scale_src),
                     "post_topk_ratio_src": topk_energy_ratio(src_vec_post, args.top_energy_k),
                     "post_topk_ratio_trg": topk_energy_ratio(trg_vec_post, args.top_energy_k),
-                    "shift_ratio_src": float(
-                        torch.sum(src_shift[0, :, 0, 0].float() ** 2).item()
-                        / max(torch.sum(src_vec_post.float() ** 2).item(), 1e-6)
-                    ),
-                    "shift_ratio_trg": float(
-                        torch.sum(trg_shift[0, :, 0, 0].float() ** 2).item()
-                        / max(torch.sum(trg_vec_post.float() ** 2).item(), 1e-6)
-                    ),
+                    "shift_ratio_src": src_post_terms["shift_ratio"],
+                    "shift_ratio_trg": trg_post_terms["shift_ratio"],
                 }
                 record.update(pair_scalars)
                 all_records.append(record)
