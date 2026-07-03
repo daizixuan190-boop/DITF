@@ -109,6 +109,9 @@ def parse_args():
     parser.add_argument("--local_rerank_topk", default=5, type=int, help="Number of forward candidates considered for local reranking.")
     parser.add_argument("--local_rerank_radius", default=1, type=int, help="Neighborhood radius in pixels for local consensus reranking.")
     parser.add_argument("--local_rerank_consensus_weight", default=0.5, type=float, help="Weight of neighborhood consensus added to center similarity.")
+    parser.add_argument("--support_match", action="store_true", default=False, help="Build a support-aware score map by aggregating offset-aligned local source evidence.")
+    parser.add_argument("--support_radius", default=1, type=int, help="Neighborhood radius for support-aware matching.")
+    parser.add_argument("--support_sigma", default=1.0, type=float, help="Gaussian weight sigma for support offsets.")
     return parser.parse_args()
 
 
@@ -245,6 +248,77 @@ def rerank_prediction_with_local_consensus(
     return best_xy
 
 
+def offset_weight(dx: int, dy: int, sigma: float) -> float:
+    if sigma <= 0:
+        return 1.0
+    return float(math.exp(-float(dx * dx + dy * dy) / (2.0 * sigma * sigma)))
+
+
+def accumulate_shifted_map(
+    accum: torch.Tensor,
+    weight_accum: torch.Tensor,
+    cos_map: torch.Tensor,
+    dx: int,
+    dy: int,
+    weight: float,
+):
+    out_h, out_w = cos_map.shape
+
+    if dy >= 0:
+        src_y0, src_y1 = dy, out_h
+        dst_y0, dst_y1 = 0, out_h - dy
+    else:
+        src_y0, src_y1 = 0, out_h + dy
+        dst_y0, dst_y1 = -dy, out_h
+
+    if dx >= 0:
+        src_x0, src_x1 = dx, out_w
+        dst_x0, dst_x1 = 0, out_w - dx
+    else:
+        src_x0, src_x1 = 0, out_w + dx
+        dst_x0, dst_x1 = -dx, out_w
+
+    if src_y0 >= src_y1 or src_x0 >= src_x1:
+        return
+
+    accum[dst_y0:dst_y1, dst_x0:dst_x1] += weight * cos_map[src_y0:src_y1, src_x0:src_x1]
+    weight_accum[dst_y0:dst_y1, dst_x0:dst_x1] += weight
+
+
+def build_support_score_map(
+    src_feat: torch.Tensor,
+    trg_feat: torch.Tensor,
+    src_x: int,
+    src_y: int,
+    src_eval_h: int,
+    src_eval_w: int,
+    trg_eval_h: int,
+    trg_eval_w: int,
+    tile_rows: int,
+    support_radius: int,
+    support_sigma: float,
+) -> torch.Tensor:
+    support_map = torch.zeros((trg_eval_h, trg_eval_w), dtype=torch.float32)
+    support_weight = torch.zeros((trg_eval_h, trg_eval_w), dtype=torch.float32)
+
+    for dy in range(-support_radius, support_radius + 1):
+        for dx in range(-support_radius, support_radius + 1):
+            src_x_off = src_x + dx
+            src_y_off = src_y + dy
+            if not (0 <= src_x_off < src_eval_w and 0 <= src_y_off < src_eval_h):
+                continue
+
+            src_vec = sample_feature_at_pixel(src_feat, src_x_off, src_y_off, src_eval_h, src_eval_w)
+            cos_map = compute_exact_cos_map_hr(src_vec, trg_feat, trg_eval_h, trg_eval_w, tile_rows)
+            weight = offset_weight(dx, dy, support_sigma)
+            accumulate_shifted_map(support_map, support_weight, cos_map, dx, dy, weight)
+
+    valid = support_weight > 0
+    score_map = torch.full_like(support_map, fill_value=-1e9)
+    score_map[valid] = support_map[valid] / support_weight[valid]
+    return score_map
+
+
 def build_summary(records: list[dict[str, Any]], oracle_topk: list[int]) -> dict[str, Any]:
     summary: dict[str, Any] = {
         "num_points": len(records),
@@ -354,8 +428,23 @@ def main():
                 src_x, src_y = int(src_point[0]), int(src_point[1])
                 trg_x, trg_y = int(trg_point[0]), int(trg_point[1])
 
-                src_vec = sample_feature_at_pixel(src_ft_post_dev, src_x, src_y, src_eval_h, src_eval_w)
-                cos_map_hr = compute_exact_cos_map_hr(src_vec, trg_ft_post_dev, trg_eval_h, trg_eval_w, args.tile_rows)
+                if args.support_match:
+                    cos_map_hr = build_support_score_map(
+                        src_ft_post_dev,
+                        trg_ft_post_dev,
+                        src_x,
+                        src_y,
+                        src_eval_h,
+                        src_eval_w,
+                        trg_eval_h,
+                        trg_eval_w,
+                        args.tile_rows,
+                        args.support_radius,
+                        args.support_sigma,
+                    )
+                else:
+                    src_vec = sample_feature_at_pixel(src_ft_post_dev, src_x, src_y, src_eval_h, src_eval_w)
+                    cos_map_hr = compute_exact_cos_map_hr(src_vec, trg_ft_post_dev, trg_eval_h, trg_eval_w, args.tile_rows)
                 if args.local_rerank:
                     pred_x, pred_y = rerank_prediction_with_local_consensus(
                         cos_map_hr,
