@@ -20,22 +20,61 @@ warnings.filterwarnings('ignore')
 import numpy as np
 from scipy.spatial.distance import cosine
 
-def maybe_apply_shift_calibration(ft_ln, shift, scale, args):
-    if not args.shift_calibration:
-        return (1 + scale) * ft_ln + shift
+def quantile_risk_map(values, quantile, tail="high"):
+    flat = values.flatten()
+    threshold = torch.quantile(flat, quantile)
 
+    if tail == "high":
+        ref = flat.max()
+        denom = (ref - threshold).clamp_min(1e-6)
+        return ((values - threshold) / denom).clamp(min=0.0, max=1.0)
+
+    if tail == "low":
+        ref = flat.min()
+        denom = (threshold - ref).clamp_min(1e-6)
+        return ((threshold - values) / denom).clamp(min=0.0, max=1.0)
+
+    raise ValueError(f"Unsupported tail: {tail}")
+
+
+def maybe_apply_shift_calibration(ft_ln, shift, scale, args):
     content = (1 + scale) * ft_ln
     ft_post = content + shift
+    if not args.shift_calibration and not args.joint_calibration:
+        return ft_post
 
     shift_energy = torch.sum(shift.float() ** 2, dim=1, keepdim=True)
+    content_energy = torch.sum(content.float() ** 2, dim=1, keepdim=True)
     post_energy = torch.sum(ft_post.float() ** 2, dim=1, keepdim=True).clamp_min(1e-6)
     shift_ratio = shift_energy / post_energy
+    content_ratio = content_energy / post_energy
 
-    flat = shift_ratio.flatten()
-    threshold = torch.quantile(flat, args.shift_calibration_quantile)
-    max_val = flat.max()
-    denom = (max_val - threshold).clamp_min(1e-6)
-    excess = ((shift_ratio - threshold) / denom).clamp(min=0.0, max=1.0)
+    if args.joint_calibration:
+        high_shift = quantile_risk_map(
+            shift_ratio,
+            args.joint_shift_quantile,
+            tail="high",
+        )
+        low_content = quantile_risk_map(
+            content_ratio,
+            args.joint_content_quantile,
+            tail="low",
+        )
+        joint_risk = high_shift * low_content
+
+        lambda_map = 1.0 - args.joint_shift_strength * joint_risk
+        lambda_map = lambda_map.clamp(min=args.joint_min_shift_lambda, max=1.0)
+
+        content_gain = 1.0 + args.joint_content_strength * joint_risk
+        content_gain = content_gain.clamp(max=args.joint_max_content_gain)
+
+        return content_gain.to(content.dtype) * content + lambda_map.to(content.dtype) * shift
+
+    excess = quantile_risk_map(
+        shift_ratio,
+        args.shift_calibration_quantile,
+        tail="high",
+    )
     lambda_map = 1.0 - args.shift_calibration_strength * excess
     lambda_map = lambda_map.clamp(min=args.shift_calibration_min_lambda, max=1.0)
 
@@ -327,6 +366,13 @@ if __name__ == "__main__":
     parser.add_argument("--shift_calibration_quantile", default=0.75, type=float, help="only suppress tokens above this shift-ratio quantile")
     parser.add_argument("--shift_calibration_strength", default=0.5, type=float, help="suppression strength for high-shift tokens")
     parser.add_argument("--shift_calibration_min_lambda", default=0.2, type=float, help="minimum retained shift scaling after calibration")
+    parser.add_argument("--joint_calibration", action="store_true", default=False, help="apply joint high-shift low-content calibration before matching")
+    parser.add_argument("--joint_shift_quantile", default=0.75, type=float, help="high-shift token threshold for joint calibration")
+    parser.add_argument("--joint_content_quantile", default=0.25, type=float, help="low-content token threshold for joint calibration")
+    parser.add_argument("--joint_shift_strength", default=0.5, type=float, help="shift suppression strength under joint calibration")
+    parser.add_argument("--joint_min_shift_lambda", default=0.2, type=float, help="minimum retained shift scaling under joint calibration")
+    parser.add_argument("--joint_content_strength", default=0.25, type=float, help="content amplification strength under joint calibration")
+    parser.add_argument("--joint_max_content_gain", default=1.5, type=float, help="upper bound for content amplification under joint calibration")
     args = parser.parse_args()
     
     torch.backends.cudnn.enabled = True
