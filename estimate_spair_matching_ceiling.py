@@ -105,6 +105,10 @@ def parse_args():
     parser.add_argument("--joint_min_shift_lambda", default=0.2, type=float, help="Minimum retained shift scaling under joint calibration.")
     parser.add_argument("--joint_content_strength", default=0.25, type=float, help="Content amplification strength under joint calibration.")
     parser.add_argument("--joint_max_content_gain", default=1.5, type=float, help="Upper bound for content amplification under joint calibration.")
+    parser.add_argument("--local_rerank", action="store_true", default=False, help="Rerank top-k forward candidates by local neighborhood feature consensus.")
+    parser.add_argument("--local_rerank_topk", default=5, type=int, help="Number of forward candidates considered for local reranking.")
+    parser.add_argument("--local_rerank_radius", default=1, type=int, help="Neighborhood radius in pixels for local consensus reranking.")
+    parser.add_argument("--local_rerank_consensus_weight", default=0.5, type=float, help="Weight of neighborhood consensus added to center similarity.")
     return parser.parse_args()
 
 
@@ -153,6 +157,92 @@ def best_valid_rank_and_score(
     best_score = float(valid_scores.max().item())
     rank = 1 + int((cos_map > best_score).sum().item())
     return rank, best_score
+
+
+def topk_candidate_points(cos_map: torch.Tensor, topk: int) -> list[tuple[int, int, float]]:
+    flat = cos_map.view(-1)
+    k = min(max(int(topk), 1), int(flat.numel()))
+    values, indices = torch.topk(flat, k=k)
+    out_w = cos_map.shape[1]
+    candidates = []
+    for score, flat_idx in zip(values.tolist(), indices.tolist()):
+        y = int(flat_idx // out_w)
+        x = int(flat_idx % out_w)
+        candidates.append((x, y, float(score)))
+    return candidates
+
+
+def local_consensus_score(
+    src_feat: torch.Tensor,
+    trg_feat: torch.Tensor,
+    src_x: int,
+    src_y: int,
+    trg_x: int,
+    trg_y: int,
+    src_eval_h: int,
+    src_eval_w: int,
+    trg_eval_h: int,
+    trg_eval_w: int,
+    radius: int,
+) -> float:
+    scores: list[float] = []
+    for dy in range(-radius, radius + 1):
+        for dx in range(-radius, radius + 1):
+            src_x_off = src_x + dx
+            src_y_off = src_y + dy
+            trg_x_off = trg_x + dx
+            trg_y_off = trg_y + dy
+            if not (0 <= src_x_off < src_eval_w and 0 <= src_y_off < src_eval_h):
+                continue
+            if not (0 <= trg_x_off < trg_eval_w and 0 <= trg_y_off < trg_eval_h):
+                continue
+            src_vec = sample_feature_at_pixel(src_feat, src_x_off, src_y_off, src_eval_h, src_eval_w)
+            trg_vec = sample_feature_at_pixel(trg_feat, trg_x_off, trg_y_off, trg_eval_h, trg_eval_w)
+            src_vec = torch.nn.functional.normalize(src_vec.view(1, -1), dim=1)
+            trg_vec = torch.nn.functional.normalize(trg_vec.view(1, -1), dim=1)
+            scores.append(float((src_vec * trg_vec).sum().item()))
+    if not scores:
+        return float("-inf")
+    return float(np.mean(scores))
+
+
+def rerank_prediction_with_local_consensus(
+    cos_map: torch.Tensor,
+    src_feat: torch.Tensor,
+    trg_feat: torch.Tensor,
+    src_x: int,
+    src_y: int,
+    src_eval_h: int,
+    src_eval_w: int,
+    trg_eval_h: int,
+    trg_eval_w: int,
+    args,
+) -> tuple[int, int]:
+    candidates = topk_candidate_points(cos_map, args.local_rerank_topk)
+    best_score = float("-inf")
+    best_xy = None
+    for cand_x, cand_y, center_score in candidates:
+        consensus = local_consensus_score(
+            src_feat,
+            trg_feat,
+            src_x,
+            src_y,
+            cand_x,
+            cand_y,
+            src_eval_h,
+            src_eval_w,
+            trg_eval_h,
+            trg_eval_w,
+            args.local_rerank_radius,
+        )
+        combined = float(center_score + args.local_rerank_consensus_weight * consensus)
+        if combined > best_score:
+            best_score = combined
+            best_xy = (cand_x, cand_y)
+    if best_xy is None:
+        pred_y, pred_x = np.unravel_index(int(cos_map.view(-1).argmax().item()), cos_map.shape)
+        return int(pred_x), int(pred_y)
+    return best_xy
 
 
 def build_summary(records: list[dict[str, Any]], oracle_topk: list[int]) -> dict[str, Any]:
@@ -266,7 +356,22 @@ def main():
 
                 src_vec = sample_feature_at_pixel(src_ft_post_dev, src_x, src_y, src_eval_h, src_eval_w)
                 cos_map_hr = compute_exact_cos_map_hr(src_vec, trg_ft_post_dev, trg_eval_h, trg_eval_w, args.tile_rows)
-                pred_y, pred_x = np.unravel_index(int(cos_map_hr.view(-1).argmax().item()), cos_map_hr.shape)
+                if args.local_rerank:
+                    pred_x, pred_y = rerank_prediction_with_local_consensus(
+                        cos_map_hr,
+                        src_ft_post_dev,
+                        trg_ft_post_dev,
+                        src_x,
+                        src_y,
+                        src_eval_h,
+                        src_eval_w,
+                        trg_eval_h,
+                        trg_eval_w,
+                        args,
+                    )
+                else:
+                    pred_y, pred_x = np.unravel_index(int(cos_map_hr.view(-1).argmax().item()), cos_map_hr.shape)
+                    pred_x, pred_y = int(pred_x), int(pred_y)
 
                 dist = math.sqrt((pred_x - trg_x) ** 2 + (pred_y - trg_y) ** 2)
                 current_correct = int((dist / max(threshold, 1e-6)) <= 0.1)
