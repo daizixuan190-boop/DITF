@@ -17,6 +17,58 @@ from analyze_spair_token_residuals import (
 )
 
 
+def quantile_risk_map(values: torch.Tensor, quantile: float, tail: str = "high") -> torch.Tensor:
+    flat = values.flatten()
+    threshold = torch.quantile(flat, quantile)
+
+    if tail == "high":
+        ref = flat.max()
+        denom = (ref - threshold).clamp_min(1e-6)
+        return ((values - threshold) / denom).clamp(min=0.0, max=1.0)
+
+    if tail == "low":
+        ref = flat.min()
+        denom = (threshold - ref).clamp_min(1e-6)
+        return ((threshold - values) / denom).clamp(min=0.0, max=1.0)
+
+    raise ValueError(f"Unsupported tail: {tail}")
+
+
+def maybe_apply_post_calibration(
+    ft_ln: torch.Tensor,
+    shift: torch.Tensor,
+    scale: torch.Tensor,
+    args,
+) -> torch.Tensor:
+    content = (1 + scale) * ft_ln
+    ft_post = content + shift
+    if not args.shift_calibration and not args.joint_calibration:
+        return ft_post
+
+    shift_energy = torch.sum(shift.float() ** 2, dim=1, keepdim=True)
+    content_energy = torch.sum(content.float() ** 2, dim=1, keepdim=True)
+    post_energy = torch.sum(ft_post.float() ** 2, dim=1, keepdim=True).clamp_min(1e-6)
+    shift_ratio = shift_energy / post_energy
+    content_ratio = content_energy / post_energy
+
+    if args.joint_calibration:
+        high_shift = quantile_risk_map(shift_ratio, args.joint_shift_quantile, tail="high")
+        low_content = quantile_risk_map(content_ratio, args.joint_content_quantile, tail="low")
+        joint_risk = high_shift * low_content
+
+        lambda_map = 1.0 - args.joint_shift_strength * joint_risk
+        lambda_map = lambda_map.clamp(min=args.joint_min_shift_lambda, max=1.0)
+
+        content_gain = 1.0 + args.joint_content_strength * joint_risk
+        content_gain = content_gain.clamp(max=args.joint_max_content_gain)
+        return content_gain.to(content.dtype) * content + lambda_map.to(content.dtype) * shift
+
+    excess = quantile_risk_map(shift_ratio, args.shift_calibration_quantile, tail="high")
+    lambda_map = 1.0 - args.shift_calibration_strength * excess
+    lambda_map = lambda_map.clamp(min=args.shift_calibration_min_lambda, max=1.0)
+    return content + lambda_map.to(content.dtype) * shift
+
+
 def parse_args():
     parser = argparse.ArgumentParser(
         description=(
@@ -42,6 +94,17 @@ def parse_args():
         default=[1, 5, 10, 50, 100, 500],
         help="Top-k cutoffs for oracle PCK on the current similarity map.",
     )
+    parser.add_argument("--shift_calibration", action="store_true", default=False, help="Apply shift-only post-AdaLN calibration before matching.")
+    parser.add_argument("--shift_calibration_quantile", default=0.75, type=float, help="Only suppress tokens above this shift-ratio quantile.")
+    parser.add_argument("--shift_calibration_strength", default=0.5, type=float, help="Suppression strength for high-shift tokens.")
+    parser.add_argument("--shift_calibration_min_lambda", default=0.2, type=float, help="Minimum retained shift scaling after calibration.")
+    parser.add_argument("--joint_calibration", action="store_true", default=False, help="Apply joint high-shift low-content calibration before matching.")
+    parser.add_argument("--joint_shift_quantile", default=0.75, type=float, help="High-shift token threshold for joint calibration.")
+    parser.add_argument("--joint_content_quantile", default=0.25, type=float, help="Low-content token threshold for joint calibration.")
+    parser.add_argument("--joint_shift_strength", default=0.5, type=float, help="Shift suppression strength under joint calibration.")
+    parser.add_argument("--joint_min_shift_lambda", default=0.2, type=float, help="Minimum retained shift scaling under joint calibration.")
+    parser.add_argument("--joint_content_strength", default=0.25, type=float, help="Content amplification strength under joint calibration.")
+    parser.add_argument("--joint_max_content_gain", default=1.5, type=float, help="Upper bound for content amplification under joint calibration.")
     return parser.parse_args()
 
 
@@ -110,6 +173,7 @@ def build_summary(records: list[dict[str, Any]], oracle_topk: list[int]) -> dict
     summary["rank_stats"] = {
         "median_oracle_rank": float(np.median(ranks)),
         "mean_oracle_rank": float(np.mean(ranks)),
+        "oracle_rank_le_1_frac": float(np.mean(ranks <= 1)),
         "oracle_rank_le_10_frac": float(np.mean(ranks <= 10)),
         "oracle_rank_le_50_frac": float(np.mean(ranks <= 50)),
         "oracle_rank_le_100_frac": float(np.mean(ranks <= 100)),
@@ -170,20 +234,22 @@ def main():
             src_imname = data["src_imname"]
             trg_imname = data["trg_imname"]
 
-            _, _, src_ft_post, _, _ = build_post_feature(
+            _, src_ft_ln, _, src_shift, src_scale = build_post_feature(
                 output_dict[src_imname].float(),
                 ada_dict[src_imname].float(),
                 pre_norm,
                 args.discard_channels,
                 args.cd,
             )
-            _, _, trg_ft_post, _, _ = build_post_feature(
+            _, trg_ft_ln, _, trg_shift, trg_scale = build_post_feature(
                 output_dict[trg_imname].float(),
                 ada_dict[trg_imname].float(),
                 pre_norm,
                 args.discard_channels,
                 args.cd,
             )
+            src_ft_post = maybe_apply_post_calibration(src_ft_ln, src_shift, src_scale, args)
+            trg_ft_post = maybe_apply_post_calibration(trg_ft_ln, trg_shift, trg_scale, args)
             src_ft_post_dev = src_ft_post.float().to(device)
             trg_ft_post_dev = trg_ft_post.float().to(device)
 
