@@ -8,6 +8,7 @@ from typing import Any
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from analyze_spair_token_residuals import (
     build_post_feature,
@@ -254,22 +255,46 @@ def offset_weight(dx: int, dy: int, sigma: float) -> float:
     return float(math.exp(-float(dx * dx + dy * dy) / (2.0 * sigma * sigma)))
 
 
-def accumulate_shifted_map(
+def make_grid_for_output_window(
+    x_start: int,
+    x_end: int,
+    y_start: int,
+    y_end: int,
+    out_h: int,
+    out_w: int,
+    device: torch.device,
+) -> torch.Tensor:
+    xs = torch.arange(x_start, x_end, dtype=torch.float32, device=device)
+    ys = torch.arange(y_start, y_end, dtype=torch.float32, device=device)
+    grid_x = 2.0 * ((xs + 0.5) / out_w) - 1.0
+    grid_y = 2.0 * ((ys + 0.5) / out_h) - 1.0
+    mesh_y, mesh_x = torch.meshgrid(grid_y, grid_x, indexing="ij")
+    return torch.stack((mesh_x, mesh_y), dim=-1).unsqueeze(0)
+
+
+def accumulate_shifted_tile(
     accum: torch.Tensor,
     weight_accum: torch.Tensor,
-    cos_map: torch.Tensor,
+    tile_map: torch.Tensor,
+    y_start: int,
+    y_end: int,
     dx: int,
     dy: int,
     weight: float,
 ):
-    out_h, out_w = cos_map.shape
+    tile_h, out_w = tile_map.shape
+    out_h = accum.shape[0]
 
     if dy >= 0:
-        src_y0, src_y1 = dy, out_h
-        dst_y0, dst_y1 = 0, out_h - dy
+        src_y0 = max(dy, y_start)
+        src_y1 = min(out_h, y_end)
+        dst_y0 = src_y0 - dy
+        dst_y1 = src_y1 - dy
     else:
-        src_y0, src_y1 = 0, out_h + dy
-        dst_y0, dst_y1 = -dy, out_h
+        src_y0 = max(0, y_start)
+        src_y1 = min(out_h + dy, y_end)
+        dst_y0 = src_y0 - dy
+        dst_y1 = src_y1 - dy
 
     if dx >= 0:
         src_x0, src_x1 = dx, out_w
@@ -278,11 +303,46 @@ def accumulate_shifted_map(
         src_x0, src_x1 = 0, out_w + dx
         dst_x0, dst_x1 = -dx, out_w
 
-    if src_y0 >= src_y1 or src_x0 >= src_x1:
+    if src_y0 >= src_y1 or src_x0 >= src_x1 or dst_y0 >= dst_y1 or dst_x0 >= dst_x1:
         return
 
-    accum[dst_y0:dst_y1, dst_x0:dst_x1] += weight * cos_map[src_y0:src_y1, src_x0:src_x1]
+    tile_src_y0 = src_y0 - y_start
+    tile_src_y1 = src_y1 - y_start
+
+    accum[dst_y0:dst_y1, dst_x0:dst_x1] += weight * tile_map[tile_src_y0:tile_src_y1, src_x0:src_x1]
     weight_accum[dst_y0:dst_y1, dst_x0:dst_x1] += weight
+
+
+def collect_support_offsets(
+    src_x: int,
+    src_y: int,
+    src_eval_h: int,
+    src_eval_w: int,
+    support_radius: int,
+    support_sigma: float,
+) -> list[tuple[int, int, int, int, float]]:
+    offsets: list[tuple[int, int, int, int, float]] = []
+    for dy in range(-support_radius, support_radius + 1):
+        for dx in range(-support_radius, support_radius + 1):
+            src_x_off = src_x + dx
+            src_y_off = src_y + dy
+            if not (0 <= src_x_off < src_eval_w and 0 <= src_y_off < src_eval_h):
+                continue
+            offsets.append((dx, dy, src_x_off, src_y_off, offset_weight(dx, dy, support_sigma)))
+    return offsets
+
+
+def sample_support_source_vectors(
+    src_feat: torch.Tensor,
+    offsets: list[tuple[int, int, int, int, float]],
+    src_eval_h: int,
+    src_eval_w: int,
+) -> torch.Tensor:
+    src_vecs = [
+        sample_feature_at_pixel(src_feat, src_x_off, src_y_off, src_eval_h, src_eval_w)
+        for _, _, src_x_off, src_y_off, _ in offsets
+    ]
+    return F.normalize(torch.stack(src_vecs, dim=0).float(), dim=1)
 
 
 def build_support_score_map(
@@ -298,25 +358,49 @@ def build_support_score_map(
     support_radius: int,
     support_sigma: float,
 ) -> torch.Tensor:
-    support_map = torch.zeros((trg_eval_h, trg_eval_w), dtype=torch.float32)
-    support_weight = torch.zeros((trg_eval_h, trg_eval_w), dtype=torch.float32)
+    offsets = collect_support_offsets(
+        src_x,
+        src_y,
+        src_eval_h,
+        src_eval_w,
+        support_radius,
+        support_sigma,
+    )
+    if not offsets:
+        src_vec = sample_feature_at_pixel(src_feat, src_x, src_y, src_eval_h, src_eval_w)
+        return compute_exact_cos_map_hr(src_vec, trg_feat, trg_eval_h, trg_eval_w, tile_rows)
 
-    for dy in range(-support_radius, support_radius + 1):
-        for dx in range(-support_radius, support_radius + 1):
-            src_x_off = src_x + dx
-            src_y_off = src_y + dy
-            if not (0 <= src_x_off < src_eval_w and 0 <= src_y_off < src_eval_h):
-                continue
+    src_vecs = sample_support_source_vectors(src_feat, offsets, src_eval_h, src_eval_w)
+    support_map = torch.zeros((trg_eval_h, trg_eval_w), dtype=torch.float32, device=trg_feat.device)
+    support_weight = torch.zeros((trg_eval_h, trg_eval_w), dtype=torch.float32, device=trg_feat.device)
+    trg_feat = trg_feat.float()
 
-            src_vec = sample_feature_at_pixel(src_feat, src_x_off, src_y_off, src_eval_h, src_eval_w)
-            cos_map = compute_exact_cos_map_hr(src_vec, trg_feat, trg_eval_h, trg_eval_w, tile_rows)
-            weight = offset_weight(dx, dy, support_sigma)
-            accumulate_shifted_map(support_map, support_weight, cos_map, dx, dy, weight)
+    for y_start in range(0, trg_eval_h, tile_rows):
+        y_end = min(y_start + tile_rows, trg_eval_h)
+        grid = make_grid_for_output_window(0, trg_eval_w, y_start, y_end, trg_eval_h, trg_eval_w, trg_feat.device)
+        tile_feat = F.grid_sample(trg_feat, grid, mode="bilinear", align_corners=False)
+        tile_feat = F.normalize(tile_feat, dim=1)[0]  # C, tile_h, out_w
+        tile_feat_flat = tile_feat.view(tile_feat.shape[0], -1)  # C, HW
+        tile_sim_flat = src_vecs @ tile_feat_flat  # N, HW
+        tile_h = y_end - y_start
+
+        for offset_idx, (dx, dy, _, _, weight) in enumerate(offsets):
+            tile_sim = tile_sim_flat[offset_idx].view(tile_h, trg_eval_w)
+            accumulate_shifted_tile(
+                support_map,
+                support_weight,
+                tile_sim,
+                y_start,
+                y_end,
+                dx,
+                dy,
+                weight,
+            )
 
     valid = support_weight > 0
     score_map = torch.full_like(support_map, fill_value=-1e9)
     score_map[valid] = support_map[valid] / support_weight[valid]
-    return score_map
+    return score_map.cpu()
 
 
 def build_summary(records: list[dict[str, Any]], oracle_topk: list[int]) -> dict[str, Any]:
