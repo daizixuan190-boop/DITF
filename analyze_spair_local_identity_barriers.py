@@ -35,16 +35,22 @@ def parse_args():
         help="Minimum top50_near_frac@x1 used to define a locally correct candidate cluster.",
     )
     parser.add_argument(
-        "--compact_spread_quantile",
+        "--local_near_frac_x2_threshold",
         type=float,
-        default=0.50,
-        help="Upper quantile for top50_spread_norm to define a compact candidate cluster.",
+        default=0.98,
+        help="Optional second local-neighborhood constraint using top50_near_frac@x2.",
     )
     parser.add_argument(
-        "--centered_centroid_quantile",
-        type=float,
-        default=0.75,
-        help="Upper quantile for top50_centroid_norm_dist to define a locally centered candidate cluster.",
+        "--target_rank_min",
+        type=int,
+        default=11,
+        help="Minimum oracle rank for the target local-neighborhood failure definition.",
+    )
+    parser.add_argument(
+        "--target_rank_max",
+        type=int,
+        default=500,
+        help="Maximum oracle rank for the target local-neighborhood failure definition.",
     )
     parser.add_argument(
         "--low_margin_quantile",
@@ -136,8 +142,6 @@ def assign_rank_bucket(oracle_rank: int) -> str:
 
 
 def build_barrier_flags(records: list[dict[str, Any]], args) -> dict[str, float]:
-    compact_spread_thr = quantile_threshold(records, "top50_spread_norm", args.compact_spread_quantile)
-    centered_centroid_thr = quantile_threshold(records, "top50_centroid_norm_dist", args.centered_centroid_quantile)
     low_gap_thr = quantile_threshold(records, "top1_top50_score_gap", args.low_margin_quantile)
     low_margin_thr = quantile_threshold(records, "sim_margin", args.low_margin_quantile)
     high_entropy_thr = quantile_threshold(records, "sim_entropy", args.high_entropy_quantile)
@@ -148,12 +152,15 @@ def build_barrier_flags(records: list[dict[str, Any]], args) -> dict[str, float]
         current_error = 1 - int(record["correct"])
         oracle_rank = int(record["oracle_best_rank"])
         rank_bucket = assign_rank_bucket(oracle_rank)
-        local_cluster = int(
+        local_neighborhood = int(
             float(record["top50_near_frac@x1"]) >= args.local_near_frac_threshold
-            and float(record["top50_spread_norm"]) <= compact_spread_thr
-            and float(record["top50_centroid_norm_dist"]) <= centered_centroid_thr
+            and float(record["top50_near_frac@x2"]) >= args.local_near_frac_x2_threshold
         )
-        local_identity_failure = int(current_error == 1 and local_cluster == 1 and oracle_rank >= 11)
+        local_identity_failure = int(
+            current_error == 1
+            and local_neighborhood == 1
+            and args.target_rank_min <= oracle_rank <= args.target_rank_max
+        )
 
         barrier_low_gap = int(float(record["top1_top50_score_gap"]) <= low_gap_thr)
         barrier_low_margin = int(float(record["sim_margin"]) <= low_margin_thr)
@@ -163,7 +170,7 @@ def build_barrier_flags(records: list[dict[str, Any]], args) -> dict[str, float]
 
         record["current_error"] = current_error
         record["rank_bucket"] = rank_bucket
-        record["local_cluster"] = local_cluster
+        record["local_neighborhood"] = local_neighborhood
         record["local_identity_failure"] = local_identity_failure
         record["barrier_low_gap"] = barrier_low_gap
         record["barrier_low_margin"] = barrier_low_margin
@@ -180,8 +187,6 @@ def build_barrier_flags(records: list[dict[str, Any]], args) -> dict[str, float]
         )
 
     return {
-        "compact_spread_threshold": compact_spread_thr,
-        "centered_centroid_threshold": centered_centroid_thr,
         "low_gap_threshold": low_gap_thr,
         "low_margin_threshold": low_margin_thr,
         "high_entropy_threshold": high_entropy_thr,
@@ -237,7 +242,7 @@ def rank_bucket_summary(records: list[dict[str, Any]], barrier_keys: list[str]) 
         bucket = {
             "count": len(subset),
             "fraction_of_failures": float(len(subset) / len(failures)),
-            "local_cluster_rate": rate(subset, "local_cluster"),
+            "local_neighborhood_rate": rate(subset, "local_neighborhood"),
             "mean_norm_dist": mean_or_none([float(record["norm_dist"]) for record in subset]),
             "mean_sim_margin": mean_or_none([float(record["sim_margin"]) for record in subset]),
             "mean_top1_top50_gap": mean_or_none([float(record["top1_top50_score_gap"]) for record in subset]),
@@ -284,7 +289,7 @@ def main():
         "thresholds": thresholds,
         "targets": {
             "local_identity_failure": summarize_target(records, "local_identity_failure"),
-            "local_cluster": summarize_target(records, "local_cluster"),
+            "local_neighborhood": summarize_target(records, "local_neighborhood"),
         },
         "barriers_within_local_identity_failure": {
             barrier_key: barrier_summary(records, "local_identity_failure", barrier_key)
@@ -295,6 +300,10 @@ def main():
             "goal": (
                 "Identify which barrier most characterizes failures where the model already focuses on the right local "
                 "semantic neighborhood but still cannot lift the GT to the front ranks."
+            ),
+            "local_identity_failure": (
+                "Target is now decoupled from spread and centroid statistics: wrong prediction, oracle GT rank lies in the "
+                "configured range, and top-50 candidates remain predominantly local around the GT neighborhood."
             ),
             "barrier_margin_suppression": (
                 "Low top1-vs-top50 gap together with low similarity margin: the GT is not separated sharply enough from nearby rivals."
