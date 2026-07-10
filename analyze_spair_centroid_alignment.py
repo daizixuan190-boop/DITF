@@ -23,6 +23,8 @@ LOCAL_GROUPS = [
     "local_fail_rank_101_500",
 ]
 
+EXCLUDE_TOPN_CHOICES = [0, 1, 5]
+
 
 def parse_args():
     parser = argparse.ArgumentParser(
@@ -42,6 +44,13 @@ def parse_args():
     parser.add_argument("--cd", action="store_true", default=False, help="Apply channel discard as in eval_spair.py.")
     parser.add_argument("--tile_rows", type=int, default=128, help="Row chunk size for GPU candidate extraction.")
     parser.add_argument("--topk_candidates", type=int, default=50, help="Number of local candidates used to define the cloud centroid.")
+    parser.add_argument(
+        "--exclude_topn_list",
+        nargs="+",
+        type=int,
+        default=EXCLUDE_TOPN_CHOICES,
+        help="Evaluate centroid alignment after excluding the first N ranked candidates from the centroid computation.",
+    )
     parser.add_argument(
         "--groups",
         nargs="+",
@@ -146,17 +155,22 @@ def safe_cosine(dx1: float, dy1: float, dx2: float, dy2: float) -> float | None:
 
 
 def summarize_group(records: list[dict[str, Any]]) -> dict[str, Any]:
-    cosines = [float(record["error_centroid_cosine"]) for record in records if record["error_centroid_cosine"] is not None]
-    return {
-        "count": len(records),
-        "mean_centroid_norm_dist": float(np.mean([float(record["centroid_norm_dist"]) for record in records])) if records else None,
-        "mean_error_norm_dist": float(np.mean([float(record["error_norm_dist"]) for record in records])) if records else None,
-        "mean_pred_centroid_norm_dist": float(np.mean([float(record["pred_centroid_norm_dist"]) for record in records])) if records else None,
-        "mean_error_centroid_cosine": float(np.mean(cosines)) if cosines else None,
-        "frac_error_centroid_cosine_gt_0": float(np.mean([c > 0.0 for c in cosines])) if cosines else None,
-        "frac_error_centroid_cosine_gt_0_5": float(np.mean([c > 0.5 for c in cosines])) if cosines else None,
-        "frac_error_centroid_cosine_gt_0_8": float(np.mean([c > 0.8 for c in cosines])) if cosines else None,
-    }
+    summary = {"count": len(records), "exclude_topn": {}}
+    exclude_values = sorted({int(record["exclude_topn"]) for record in records}) if records else []
+    for exclude_topn in exclude_values:
+        subset = [record for record in records if int(record["exclude_topn"]) == exclude_topn]
+        cosines = [float(record["error_centroid_cosine"]) for record in subset if record["error_centroid_cosine"] is not None]
+        summary["exclude_topn"][str(exclude_topn)] = {
+            "count": len(subset),
+            "mean_centroid_norm_dist": float(np.mean([float(record["centroid_norm_dist"]) for record in subset])) if subset else None,
+            "mean_error_norm_dist": float(np.mean([float(record["error_norm_dist"]) for record in subset])) if subset else None,
+            "mean_pred_centroid_norm_dist": float(np.mean([float(record["pred_centroid_norm_dist"]) for record in subset])) if subset else None,
+            "mean_error_centroid_cosine": float(np.mean(cosines)) if cosines else None,
+            "frac_error_centroid_cosine_gt_0": float(np.mean([c > 0.0 for c in cosines])) if cosines else None,
+            "frac_error_centroid_cosine_gt_0_5": float(np.mean([c > 0.5 for c in cosines])) if cosines else None,
+            "frac_error_centroid_cosine_gt_0_8": float(np.mean([c > 0.8 for c in cosines])) if cosines else None,
+        }
+    return summary
 
 
 def main():
@@ -242,42 +256,55 @@ def main():
             if candidate_idx.size == 0:
                 continue
 
-            xs = (candidate_idx % trg_eval_w).astype(np.float64)
-            ys = (candidate_idx // trg_eval_w).astype(np.float64)
-            centroid_x = float(np.mean(xs))
-            centroid_y = float(np.mean(ys))
-
-            centroid_dx = centroid_x - float(trg_x)
-            centroid_dy = centroid_y - float(trg_y)
             error_dx = float(pred_x - trg_x)
             error_dy = float(pred_y - trg_y)
-            pred_centroid_dx = float(pred_x) - centroid_x
-            pred_centroid_dy = float(pred_y) - centroid_y
-
-            centroid_norm_dist = float(math.sqrt(centroid_dx * centroid_dx + centroid_dy * centroid_dy) / max(float(threshold), 1e-6))
             error_norm_dist = float(math.sqrt(error_dx * error_dx + error_dy * error_dy) / max(float(threshold), 1e-6))
-            pred_centroid_norm_dist = float(
-                math.sqrt(pred_centroid_dx * pred_centroid_dx + pred_centroid_dy * pred_centroid_dy) / max(float(threshold), 1e-6)
-            )
-            error_centroid_cosine = safe_cosine(error_dx, error_dy, centroid_dx, centroid_dy)
 
-            out_record = dict(record)
-            out_record.update(
-                {
-                    "centroid_x_topk": centroid_x,
-                    "centroid_y_topk": centroid_y,
-                    "centroid_dx": centroid_dx,
-                    "centroid_dy": centroid_dy,
-                    "centroid_norm_dist": centroid_norm_dist,
-                    "error_dx": error_dx,
-                    "error_dy": error_dy,
-                    "error_norm_dist": error_norm_dist,
-                    "pred_centroid_norm_dist": pred_centroid_norm_dist,
-                    "error_centroid_cosine": error_centroid_cosine,
-                    "same_half_plane": None if error_centroid_cosine is None else int(error_centroid_cosine > 0.0),
-                }
-            )
-            output_records.append(out_record)
+            for exclude_topn in args.exclude_topn_list:
+                exclude_topn = int(exclude_topn)
+                if exclude_topn < 0 or exclude_topn >= candidate_idx.size:
+                    continue
+                kept_idx = candidate_idx[exclude_topn:]
+                if kept_idx.size == 0:
+                    continue
+
+                xs = (kept_idx % trg_eval_w).astype(np.float64)
+                ys = (kept_idx // trg_eval_w).astype(np.float64)
+                centroid_x = float(np.mean(xs))
+                centroid_y = float(np.mean(ys))
+
+                centroid_dx = centroid_x - float(trg_x)
+                centroid_dy = centroid_y - float(trg_y)
+                pred_centroid_dx = float(pred_x) - centroid_x
+                pred_centroid_dy = float(pred_y) - centroid_y
+
+                centroid_norm_dist = float(
+                    math.sqrt(centroid_dx * centroid_dx + centroid_dy * centroid_dy) / max(float(threshold), 1e-6)
+                )
+                pred_centroid_norm_dist = float(
+                    math.sqrt(pred_centroid_dx * pred_centroid_dx + pred_centroid_dy * pred_centroid_dy)
+                    / max(float(threshold), 1e-6)
+                )
+                error_centroid_cosine = safe_cosine(error_dx, error_dy, centroid_dx, centroid_dy)
+
+                out_record = dict(record)
+                out_record.update(
+                    {
+                        "exclude_topn": exclude_topn,
+                        "centroid_x_topk": centroid_x,
+                        "centroid_y_topk": centroid_y,
+                        "centroid_dx": centroid_dx,
+                        "centroid_dy": centroid_dy,
+                        "centroid_norm_dist": centroid_norm_dist,
+                        "error_dx": error_dx,
+                        "error_dy": error_dy,
+                        "error_norm_dist": error_norm_dist,
+                        "pred_centroid_norm_dist": pred_centroid_norm_dist,
+                        "error_centroid_cosine": error_centroid_cosine,
+                        "same_half_plane": None if error_centroid_cosine is None else int(error_centroid_cosine > 0.0),
+                    }
+                )
+                output_records.append(out_record)
 
         processed_pairs += 1
         if processed_pairs % args.flush_every_pairs == 0:
@@ -310,12 +337,14 @@ def main():
     print(f"Saved summary to: {output_json}")
     print(f"Num analyzed records: {summary['num_analyzed_records']}")
     for group, stats in group_summary.items():
-        print(
-            f"{group}: count={stats['count']} "
-            f"mean_centroid_norm_dist={stats['mean_centroid_norm_dist']} "
-            f"mean_error_centroid_cosine={stats['mean_error_centroid_cosine']} "
-            f"frac_cos_gt_0={stats['frac_error_centroid_cosine_gt_0']}"
-        )
+        print(f"{group}: count={stats['count']}")
+        for exclude_topn, substats in stats["exclude_topn"].items():
+            print(
+                f"  exclude_topn={exclude_topn} "
+                f"mean_centroid_norm_dist={substats['mean_centroid_norm_dist']} "
+                f"mean_error_centroid_cosine={substats['mean_error_centroid_cosine']} "
+                f"frac_cos_gt_0={substats['frac_error_centroid_cosine_gt_0']}"
+            )
 
 
 if __name__ == "__main__":
