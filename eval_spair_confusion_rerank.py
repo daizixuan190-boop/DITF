@@ -21,6 +21,19 @@ import numpy as np
 from scipy.spatial.distance import cosine
 
 
+def topk_candidates_from_scores(score_vec, width, topk):
+    k = min(int(topk), int(score_vec.numel()))
+    if k <= 0:
+        return []
+    top_vals, top_idx = torch.topk(score_vec, k=k, dim=0)
+    cand_y = torch.div(top_idx, width, rounding_mode='floor')
+    cand_x = top_idx % width
+    return [
+        (int(cand_x[i].item()), int(cand_y[i].item()), float(top_vals[i].item()))
+        for i in range(k)
+    ]
+
+
 def topk_candidates(cos_map, topk):
     flat = cos_map.reshape(-1)
     k = min(int(topk), int(flat.size))
@@ -95,6 +108,125 @@ def confusion_local_rerank(src_ft, trg_ft, src_point, candidate_list, src_thresh
             best_score = combined
             best_xy = (cand_x, cand_y)
     return best_xy if best_xy is not None else (candidate_list[0][0], candidate_list[0][1])
+
+
+def build_pair_candidate_records(src_ft, trg_ft, src_points, src_threshold, topk, reverse_weight):
+    channels = src_ft.shape[1]
+    src_h, src_w = src_ft.shape[-2:]
+    trg_h, trg_w = trg_ft.shape[-2:]
+
+    src_matrix = src_ft.view(channels, -1).transpose(0, 1)
+    src_matrix = F.normalize(src_matrix, dim=1)
+    trg_matrix = trg_ft.view(channels, -1).transpose(0, 1)
+    trg_matrix = F.normalize(trg_matrix, dim=1)
+
+    records = []
+    for src_point in src_points:
+        src_x, src_y = int(src_point[0]), int(src_point[1])
+        src_vec = src_ft[0, :, src_y, src_x].view(1, channels)
+        src_vec = F.normalize(src_vec, dim=1).transpose(0, 1)
+        score_vec = torch.mm(trg_matrix, src_vec).squeeze(1)
+
+        k = min(int(topk), int(score_vec.numel()))
+        top_vals, top_idx = torch.topk(score_vec, k=k, dim=0)
+        cand_y = torch.div(top_idx, trg_w, rounding_mode='floor')
+        cand_x = top_idx % trg_w
+
+        cand_vecs = trg_matrix[top_idx]
+        reverse_scores = torch.mm(src_matrix, cand_vecs.transpose(0, 1))
+        rev_idx = torch.argmax(reverse_scores, dim=0)
+        rev_y = torch.div(rev_idx, src_w, rounding_mode='floor')
+        rev_x = rev_idx % src_w
+        reverse_dist = torch.sqrt(
+            (rev_x.float() - float(src_x)) ** 2 + (rev_y.float() - float(src_y)) ** 2
+        ) / max(float(src_threshold), 1e-6)
+        base_scores = top_vals.float() - float(reverse_weight) * reverse_dist
+
+        if k > 1:
+            margin = float((base_scores[0] - base_scores[1]).item())
+        else:
+            margin = float(base_scores[0].item())
+
+        records.append(
+            {
+                "src_xy": (src_x, src_y),
+                "cand_x": cand_x,
+                "cand_y": cand_y,
+                "base_scores": base_scores,
+                "anchor_idx": int(torch.argmax(base_scores).item()),
+                "margin": margin,
+            }
+        )
+
+    return records
+
+
+def confusion_pair_rerank(records, src_threshold, trg_threshold, args):
+    if not records:
+        return []
+
+    device = records[0]["base_scores"].device
+    src_xy = torch.tensor([record["src_xy"] for record in records], device=device, dtype=torch.float32)
+    src_pair_dists = torch.cdist(src_xy, src_xy) / max(float(src_threshold), 1e-6)
+
+    current_choice = [record["anchor_idx"] for record in records]
+    anchor_strength = torch.tensor(
+        [max(record["margin"], 0.0) for record in records],
+        device=device,
+        dtype=torch.float32,
+    )
+    if float(anchor_strength.max().item()) > 0.0:
+        anchor_strength = anchor_strength / anchor_strength.max().clamp_min(1e-6)
+    else:
+        anchor_strength = torch.ones_like(anchor_strength)
+
+    for _ in range(max(int(args.cpr_iters), 1)):
+        changed = False
+        anchor_xy = torch.stack(
+            [
+                torch.tensor(
+                    [
+                        float(records[i]["cand_x"][current_choice[i]].item()),
+                        float(records[i]["cand_y"][current_choice[i]].item()),
+                    ],
+                    device=device,
+                    dtype=torch.float32,
+                )
+                for i in range(len(records))
+            ],
+            dim=0,
+        )
+
+        for i, record in enumerate(records):
+            cand_xy = torch.stack(
+                [record["cand_x"].float(), record["cand_y"].float()],
+                dim=1,
+            )
+            target_dists = torch.cdist(cand_xy, anchor_xy) / max(float(trg_threshold), 1e-6)
+            overlap = (1.0 - target_dists / float(args.cpr_radius)).clamp(min=0.0)
+
+            sep_mask = (src_pair_dists[i] >= float(args.cpr_src_separation)).float()
+            sep_mask[i] = 0.0
+            penalty = overlap * sep_mask.unsqueeze(0) * anchor_strength.unsqueeze(0)
+            final_scores = record["base_scores"] - float(args.cpr_weight) * penalty.sum(dim=1)
+
+            best_idx = int(torch.argmax(final_scores).item())
+            if best_idx != current_choice[i]:
+                current_choice[i] = best_idx
+                changed = True
+
+        if not changed:
+            break
+
+    pred_xy = []
+    for i, record in enumerate(records):
+        pred_xy.append(
+            (
+                int(record["cand_x"][current_choice[i]].item()),
+                int(record["cand_y"][current_choice[i]].item()),
+            )
+        )
+    return pred_xy
 
 def quantile_risk_map(values, quantile, tail="high"):
     flat = values.flatten()
@@ -358,38 +490,58 @@ def main(args):
 
             total = 0
             correct = 0
-            src_list = []
             trg_list = []
-            
-            # print(len(data['src_kps']))
-            for idx in range(len(data['src_kps'])):
+            src_points = data['src_kps']
+            trg_points = data['trg_kps']
+            num_channel = src_ft.size(1)
+            trg_vec = trg_ft.view(num_channel, -1).transpose(0, 1)
+            trg_vec = F.normalize(trg_vec, dim=1)
+
+            pair_predictions = None
+            if args.confusion_pair_rerank:
+                pair_records = build_pair_candidate_records(
+                    src_ft,
+                    trg_ft,
+                    src_points,
+                    src_threshold,
+                    args.cpr_topk,
+                    args.cpr_reverse_weight,
+                )
+                pair_predictions = confusion_pair_rerank(
+                    pair_records,
+                    src_threshold,
+                    threshold,
+                    args,
+                )
+
+            for idx in range(len(src_points)):
                 total += 1
                 cat_total += 1
                 all_total += 1
-                src_point = data['src_kps'][idx]
-                trg_point = data['trg_kps'][idx]
-                src_list.append(src_point)
-                num_channel = src_ft.size(1)
-                src_vec = src_ft[0, :, src_point[1], src_point[0]].view(1, num_channel) # 1, C
-                trg_vec = trg_ft.view(num_channel, -1).transpose(0, 1) # HW, C
-                src_vec = F.normalize(src_vec).transpose(0, 1) # c, 1
-                trg_vec = F.normalize(trg_vec) # HW, c
-                
-                cos_map = torch.mm(trg_vec, src_vec).view(h, w).cpu().numpy() # H, W
+                src_point = src_points[idx]
+                trg_point = trg_points[idx]
 
-                if args.confusion_local_rerank:
-                    candidates = topk_candidates(cos_map, args.clr_topk)
-                    pred_x, pred_y = confusion_local_rerank(
-                        src_ft,
-                        trg_ft,
-                        src_point,
-                        candidates,
-                        src_threshold,
-                        args,
-                    )
+                if pair_predictions is not None:
+                    pred_x, pred_y = pair_predictions[idx]
                 else:
-                    max_yx = np.unravel_index(cos_map.argmax(), cos_map.shape)
-                    pred_x, pred_y = int(max_yx[1]), int(max_yx[0])
+                    src_vec = src_ft[0, :, src_point[1], src_point[0]].view(1, num_channel)
+                    src_vec = F.normalize(src_vec, dim=1).transpose(0, 1)
+                    score_vec = torch.mm(trg_vec, src_vec).squeeze(1)
+
+                    if args.confusion_local_rerank:
+                        candidates = topk_candidates_from_scores(score_vec, w, args.clr_topk)
+                        pred_x, pred_y = confusion_local_rerank(
+                            src_ft,
+                            trg_ft,
+                            src_point,
+                            candidates,
+                            src_threshold,
+                            args,
+                        )
+                    else:
+                        max_idx = int(torch.argmax(score_vec).item())
+                        pred_y = max_idx // w
+                        pred_x = max_idx % w
 
                 trg_list.append([pred_x, pred_y])
                 dist = ((pred_x - trg_point[0]) ** 2 + (pred_y - trg_point[1]) ** 2) ** 0.5
@@ -400,10 +552,6 @@ def main(args):
 
             cat_pck.append(correct / total)
             
-            # gc.collect()
-            torch.cuda.empty_cache()
-        
-        
         total_pck.extend(cat_pck)
         
         mean_image_sum = mean_image_sum + np.mean(cat_pck) * 100
@@ -433,7 +581,12 @@ def main(args):
     save_dir = os.path.join("layers_cat", args.dit_model)
     os.makedirs(save_dir, exist_ok=True)
     method_tag = "baseline"
-    if args.confusion_local_rerank:
+    if args.confusion_pair_rerank:
+        method_tag = (
+            f"cpr_topk{args.cpr_topk}_r{args.cpr_radius}_w{args.cpr_weight}"
+            f"_src{args.cpr_src_separation}_it{args.cpr_iters}_rw{args.cpr_reverse_weight}"
+        )
+    elif args.confusion_local_rerank:
         method_tag = f"clr_topk{args.clr_topk}_r{args.clr_radius}_sw{args.clr_structure_weight}_rw{args.clr_reverse_weight}"
     with open(os.path.join(save_dir, f't{args.t}_b{args.k}_e{args.ensemble_size}_{method_tag}.json'), 'w+') as json_file:
         json.dump(result, json_file, indent=4, ensure_ascii=False)
@@ -472,6 +625,13 @@ if __name__ == "__main__":
     parser.add_argument("--clr_radius", default=1, type=int, help="local structure radius in pixels")
     parser.add_argument("--clr_structure_weight", default=0.2, type=float, help="weight for local structure agreement bonus")
     parser.add_argument("--clr_reverse_weight", default=0.1, type=float, help="weight for reverse inconsistency penalty")
+    parser.add_argument("--confusion_pair_rerank", action="store_true", default=False, help="rerank keypoints jointly to suppress collapse onto another target part")
+    parser.add_argument("--cpr_topk", default=5, type=int, help="number of forward candidates retained per source keypoint for pair-level reranking")
+    parser.add_argument("--cpr_radius", default=0.6, type=float, help="target-space suppression radius normalized by target threshold")
+    parser.add_argument("--cpr_weight", default=0.2, type=float, help="strength of pair-level overlap suppression")
+    parser.add_argument("--cpr_src_separation", default=0.6, type=float, help="minimum source-space separation for two keypoints to repel each other")
+    parser.add_argument("--cpr_iters", default=2, type=int, help="number of pair-level reranking refinement iterations")
+    parser.add_argument("--cpr_reverse_weight", default=0.1, type=float, help="reverse-cycle penalty weight inside pair-level candidate scoring")
     args = parser.parse_args()
     
     torch.backends.cudnn.enabled = True
