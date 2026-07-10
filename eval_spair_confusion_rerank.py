@@ -19,6 +19,7 @@ warnings.filterwarnings('ignore')
 
 import numpy as np
 from scipy.spatial.distance import cosine
+from scipy.optimize import linear_sum_assignment
 
 
 def topk_candidates_from_scores(score_vec, width, topk):
@@ -120,28 +121,38 @@ def build_pair_candidate_records(src_ft, trg_ft, src_points, src_threshold, topk
     trg_matrix = trg_ft.view(channels, -1).transpose(0, 1)
     trg_matrix = F.normalize(trg_matrix, dim=1)
 
+    src_xy = torch.tensor(
+        [(int(point[0]), int(point[1])) for point in src_points],
+        device=src_ft.device,
+        dtype=torch.long,
+    )
+    src_vecs = src_ft[0, :, src_xy[:, 1], src_xy[:, 0]].transpose(0, 1).contiguous()
+    src_vecs = F.normalize(src_vecs, dim=1)
+    score_mat = torch.mm(trg_matrix, src_vecs.transpose(0, 1))
+    k = min(int(topk), int(score_mat.shape[0]))
+    top_vals, top_idx = torch.topk(score_mat, k=k, dim=0)
+    cand_y = torch.div(top_idx, trg_w, rounding_mode='floor')
+    cand_x = top_idx % trg_w
+
+    cand_flat_idx = top_idx.reshape(-1)
+    cand_vecs = trg_matrix[cand_flat_idx]
+    reverse_scores = torch.mm(src_matrix, cand_vecs.transpose(0, 1))
+    rev_idx = torch.argmax(reverse_scores, dim=0)
+    rev_y = torch.div(rev_idx, src_w, rounding_mode='floor')
+    rev_x = rev_idx % src_w
+
+    src_x_repeat = src_xy[:, 0].float().repeat_interleave(k)
+    src_y_repeat = src_xy[:, 1].float().repeat_interleave(k)
+    reverse_dist = torch.sqrt(
+        (rev_x.float() - src_x_repeat) ** 2 + (rev_y.float() - src_y_repeat) ** 2
+    ) / max(float(src_threshold), 1e-6)
+    reverse_dist = reverse_dist.view(k, -1)
+    base_score_mat = top_vals.float() - float(reverse_weight) * reverse_dist
+
     records = []
-    for src_point in src_points:
+    for point_idx, src_point in enumerate(src_points):
         src_x, src_y = int(src_point[0]), int(src_point[1])
-        src_vec = src_ft[0, :, src_y, src_x].view(1, channels)
-        src_vec = F.normalize(src_vec, dim=1).transpose(0, 1)
-        score_vec = torch.mm(trg_matrix, src_vec).squeeze(1)
-
-        k = min(int(topk), int(score_vec.numel()))
-        top_vals, top_idx = torch.topk(score_vec, k=k, dim=0)
-        cand_y = torch.div(top_idx, trg_w, rounding_mode='floor')
-        cand_x = top_idx % trg_w
-
-        cand_vecs = trg_matrix[top_idx]
-        reverse_scores = torch.mm(src_matrix, cand_vecs.transpose(0, 1))
-        rev_idx = torch.argmax(reverse_scores, dim=0)
-        rev_y = torch.div(rev_idx, src_w, rounding_mode='floor')
-        rev_x = rev_idx % src_w
-        reverse_dist = torch.sqrt(
-            (rev_x.float() - float(src_x)) ** 2 + (rev_y.float() - float(src_y)) ** 2
-        ) / max(float(src_threshold), 1e-6)
-        base_scores = top_vals.float() - float(reverse_weight) * reverse_dist
-
+        base_scores = base_score_mat[:, point_idx]
         if k > 1:
             margin = float((base_scores[0] - base_scores[1]).item())
         else:
@@ -150,8 +161,8 @@ def build_pair_candidate_records(src_ft, trg_ft, src_points, src_threshold, topk
         records.append(
             {
                 "src_xy": (src_x, src_y),
-                "cand_x": cand_x,
-                "cand_y": cand_y,
+                "cand_x": cand_x[:, point_idx],
+                "cand_y": cand_y[:, point_idx],
                 "base_scores": base_scores,
                 "anchor_idx": int(torch.argmax(base_scores).item()),
                 "margin": margin,
@@ -226,6 +237,99 @@ def confusion_pair_rerank(records, src_threshold, trg_threshold, args):
                 int(record["cand_y"][current_choice[i]].item()),
             )
         )
+    return pred_xy
+
+
+def cluster_target_slots(records, trg_threshold, radius):
+    slot_centers = []
+    slots = []
+    norm_radius = max(float(trg_threshold), 1e-6) * float(radius)
+
+    for src_idx, record in enumerate(records):
+        cand_x = record["cand_x"].detach().cpu().tolist()
+        cand_y = record["cand_y"].detach().cpu().tolist()
+        base_scores = record["base_scores"].detach().cpu().tolist()
+        for cand_idx, (x, y, score) in enumerate(zip(cand_x, cand_y, base_scores)):
+            assigned = None
+            for slot_idx, center in enumerate(slot_centers):
+                dist = ((x - center[0]) ** 2 + (y - center[1]) ** 2) ** 0.5
+                if dist <= norm_radius:
+                    assigned = slot_idx
+                    break
+            if assigned is None:
+                assigned = len(slot_centers)
+                slot_centers.append([float(x), float(y), 1.0])
+                slots.append([])
+            else:
+                center = slot_centers[assigned]
+                center[0] += float(x)
+                center[1] += float(y)
+                center[2] += 1.0
+            slots[assigned].append(
+                {
+                    "src_idx": src_idx,
+                    "cand_idx": cand_idx,
+                    "x": int(x),
+                    "y": int(y),
+                    "score": float(score),
+                }
+            )
+
+    slot_summary = []
+    for slot_idx, center in enumerate(slot_centers):
+        slot_summary.append(
+            {
+                "center_x": center[0] / center[2],
+                "center_y": center[1] / center[2],
+                "members": slots[slot_idx],
+            }
+        )
+    return slot_summary
+
+
+def assignment_confusion_rerank(records, trg_threshold, args):
+    num_points = len(records)
+    if num_points == 0:
+        return []
+
+    slots = cluster_target_slots(records, trg_threshold, args.acr_radius)
+    num_slots = len(slots)
+    total_cols = num_slots + num_points
+    score_matrix = np.full((num_points, total_cols), -1e6, dtype=np.float32)
+    pick_matrix = [[None for _ in range(total_cols)] for _ in range(num_points)]
+
+    for slot_idx, slot in enumerate(slots):
+        for member in slot["members"]:
+            src_idx = member["src_idx"]
+            if member["score"] > score_matrix[src_idx, slot_idx]:
+                score_matrix[src_idx, slot_idx] = member["score"]
+                pick_matrix[src_idx][slot_idx] = (member["x"], member["y"])
+
+    for src_idx, record in enumerate(records):
+        anchor_idx = int(torch.argmax(record["base_scores"]).item())
+        fallback_score = float(record["base_scores"][anchor_idx].item()) - float(args.acr_fallback_penalty)
+        col_idx = num_slots + src_idx
+        score_matrix[src_idx, col_idx] = fallback_score
+        pick_matrix[src_idx][col_idx] = (
+            int(record["cand_x"][anchor_idx].item()),
+            int(record["cand_y"][anchor_idx].item()),
+        )
+
+    row_ind, col_ind = linear_sum_assignment(-score_matrix)
+    chosen = [None] * num_points
+    for row, col in zip(row_ind, col_ind):
+        chosen[row] = pick_matrix[row][col]
+
+    pred_xy = []
+    for src_idx, record in enumerate(records):
+        xy = chosen[src_idx]
+        if xy is None:
+            anchor_idx = int(torch.argmax(record["base_scores"]).item())
+            xy = (
+                int(record["cand_x"][anchor_idx].item()),
+                int(record["cand_y"][anchor_idx].item()),
+            )
+        pred_xy.append(xy)
     return pred_xy
 
 def quantile_risk_map(values, quantile, tail="high"):
@@ -498,21 +602,28 @@ def main(args):
             trg_vec = F.normalize(trg_vec, dim=1)
 
             pair_predictions = None
-            if args.confusion_pair_rerank:
+            if args.assignment_confusion_rerank or args.confusion_pair_rerank:
                 pair_records = build_pair_candidate_records(
                     src_ft,
                     trg_ft,
                     src_points,
                     src_threshold,
-                    args.cpr_topk,
-                    args.cpr_reverse_weight,
+                    args.acr_topk if args.assignment_confusion_rerank else args.cpr_topk,
+                    args.acr_reverse_weight if args.assignment_confusion_rerank else args.cpr_reverse_weight,
                 )
-                pair_predictions = confusion_pair_rerank(
-                    pair_records,
-                    src_threshold,
-                    threshold,
-                    args,
-                )
+                if args.assignment_confusion_rerank:
+                    pair_predictions = assignment_confusion_rerank(
+                        pair_records,
+                        threshold,
+                        args,
+                    )
+                else:
+                    pair_predictions = confusion_pair_rerank(
+                        pair_records,
+                        src_threshold,
+                        threshold,
+                        args,
+                    )
 
             for idx in range(len(src_points)):
                 total += 1
@@ -581,7 +692,12 @@ def main(args):
     save_dir = os.path.join("layers_cat", args.dit_model)
     os.makedirs(save_dir, exist_ok=True)
     method_tag = "baseline"
-    if args.confusion_pair_rerank:
+    if args.assignment_confusion_rerank:
+        method_tag = (
+            f"acr_topk{args.acr_topk}_r{args.acr_radius}_fb{args.acr_fallback_penalty}"
+            f"_rw{args.acr_reverse_weight}"
+        )
+    elif args.confusion_pair_rerank:
         method_tag = (
             f"cpr_topk{args.cpr_topk}_r{args.cpr_radius}_w{args.cpr_weight}"
             f"_src{args.cpr_src_separation}_it{args.cpr_iters}_rw{args.cpr_reverse_weight}"
@@ -632,6 +748,11 @@ if __name__ == "__main__":
     parser.add_argument("--cpr_src_separation", default=0.6, type=float, help="minimum source-space separation for two keypoints to repel each other")
     parser.add_argument("--cpr_iters", default=2, type=int, help="number of pair-level reranking refinement iterations")
     parser.add_argument("--cpr_reverse_weight", default=0.1, type=float, help="reverse-cycle penalty weight inside pair-level candidate scoring")
+    parser.add_argument("--assignment_confusion_rerank", action="store_true", default=False, help="solve a unique-slot assignment over local target basins to reduce other-part attraction")
+    parser.add_argument("--acr_topk", default=5, type=int, help="number of local candidates retained per source keypoint for assignment reranking")
+    parser.add_argument("--acr_radius", default=0.6, type=float, help="target-space clustering radius normalized by target threshold")
+    parser.add_argument("--acr_fallback_penalty", default=0.05, type=float, help="penalty for falling back to the source-specific best candidate instead of a shared unique slot")
+    parser.add_argument("--acr_reverse_weight", default=0.1, type=float, help="reverse-cycle penalty weight inside assignment candidate scoring")
     args = parser.parse_args()
     
     torch.backends.cudnn.enabled = True
