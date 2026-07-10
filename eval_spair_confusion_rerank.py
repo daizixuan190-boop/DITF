@@ -22,6 +22,16 @@ from scipy.spatial.distance import cosine
 from scipy.optimize import linear_sum_assignment
 
 
+def build_offset_list(radius, step):
+    offsets = []
+    for dy in range(-radius, radius + 1, step):
+        for dx in range(-radius, radius + 1, step):
+            if dx == 0 and dy == 0:
+                continue
+            offsets.append((dx, dy))
+    return offsets
+
+
 def topk_candidates_from_scores(score_vec, width, topk):
     k = min(int(topk), int(score_vec.numel()))
     if k <= 0:
@@ -109,6 +119,99 @@ def confusion_local_rerank(src_ft, trg_ft, src_point, candidate_list, src_thresh
             best_score = combined
             best_xy = (cand_x, cand_y)
     return best_xy if best_xy is not None else (candidate_list[0][0], candidate_list[0][1])
+
+
+def local_identity_rescore(src_ft, trg_ft, src_point, score_vec, width, src_threshold, args):
+    k = min(int(args.lir_topk), int(score_vec.numel()))
+    if k <= 0:
+        max_idx = int(torch.argmax(score_vec).item())
+        return max_idx % width, max_idx // width
+
+    top_vals, top_idx = torch.topk(score_vec, k=k, dim=0)
+    cand_y = torch.div(top_idx, width, rounding_mode='floor')
+    cand_x = top_idx % width
+
+    _, channels, src_h, src_w = src_ft.shape
+    _, _, trg_h, trg_w = trg_ft.shape
+    src_x = int(src_point[0])
+    src_y = int(src_point[1])
+    offsets = build_offset_list(int(args.lir_radius), int(args.lir_offset_step))
+    if not offsets:
+        return int(cand_x[0].item()), int(cand_y[0].item())
+
+    src_center = F.normalize(src_ft[0, :, src_y, src_x].float().view(1, channels), dim=1)
+    src_valid_x = []
+    src_valid_y = []
+    src_valid_offsets = []
+    for dx, dy in offsets:
+        sx = src_x + dx
+        sy = src_y + dy
+        if 0 <= sx < src_w and 0 <= sy < src_h:
+            src_valid_x.append(sx)
+            src_valid_y.append(sy)
+            src_valid_offsets.append((dx, dy))
+
+    if len(src_valid_offsets) < int(args.lir_min_offsets):
+        return int(cand_x[0].item()), int(cand_y[0].item())
+
+    src_nb = src_ft[0, :, src_valid_y, src_valid_x].transpose(0, 1).float()
+    src_nb = F.normalize(src_nb, dim=1)
+    src_profile = torch.mm(src_nb, src_center.transpose(0, 1)).squeeze(1)
+
+    best_score = None
+    best_xy = (int(cand_x[0].item()), int(cand_y[0].item()))
+    for cand_idx in range(k):
+        tx = int(cand_x[cand_idx].item())
+        ty = int(cand_y[cand_idx].item())
+
+        valid_ids = []
+        trg_valid_x = []
+        trg_valid_y = []
+        for offset_idx, (dx, dy) in enumerate(src_valid_offsets):
+            nx = tx + dx
+            ny = ty + dy
+            if 0 <= nx < trg_w and 0 <= ny < trg_h:
+                valid_ids.append(offset_idx)
+                trg_valid_x.append(nx)
+                trg_valid_y.append(ny)
+
+        if len(valid_ids) < int(args.lir_min_offsets):
+            profile_agreement = 0.0
+            neighbor_agreement = 0.0
+        else:
+            valid_idx_tensor = torch.tensor(valid_ids, device=src_profile.device, dtype=torch.long)
+            src_profile_valid = src_profile.index_select(0, valid_idx_tensor)
+            src_nb_valid = src_nb.index_select(0, valid_idx_tensor)
+
+            trg_center = F.normalize(trg_ft[0, :, ty, tx].float().view(1, channels), dim=1)
+            trg_nb = trg_ft[0, :, trg_valid_y, trg_valid_x].transpose(0, 1).float()
+            trg_nb = F.normalize(trg_nb, dim=1)
+            trg_profile = torch.mm(trg_nb, trg_center.transpose(0, 1)).squeeze(1)
+
+            profile_agreement = float(
+                F.cosine_similarity(
+                    src_profile_valid.view(1, -1),
+                    trg_profile.view(1, -1),
+                    dim=1,
+                ).item()
+            )
+            neighbor_agreement = float(torch.mean(torch.sum(src_nb_valid * trg_nb, dim=1)).item())
+
+        reverse_penalty = 0.0
+        if args.lir_reverse_weight > 0:
+            reverse_penalty = reverse_cycle_distance(src_ft, trg_ft, src_x, src_y, tx, ty, src_threshold)
+
+        combined = (
+            float(top_vals[cand_idx].item())
+            + float(args.lir_profile_weight) * profile_agreement
+            + float(args.lir_neighbor_weight) * neighbor_agreement
+            - float(args.lir_reverse_weight) * reverse_penalty
+        )
+        if best_score is None or combined > best_score:
+            best_score = combined
+            best_xy = (tx, ty)
+
+    return best_xy
 
 
 def build_pair_candidate_records(src_ft, trg_ft, src_points, src_threshold, topk, reverse_weight):
@@ -649,6 +752,16 @@ def main(args):
                             src_threshold,
                             args,
                         )
+                    elif args.local_identity_rescore:
+                        pred_x, pred_y = local_identity_rescore(
+                            src_ft,
+                            trg_ft,
+                            src_point,
+                            score_vec,
+                            w,
+                            src_threshold,
+                            args,
+                        )
                     else:
                         max_idx = int(torch.argmax(score_vec).item())
                         pred_y = max_idx // w
@@ -696,6 +809,11 @@ def main(args):
         method_tag = (
             f"acr_topk{args.acr_topk}_r{args.acr_radius}_fb{args.acr_fallback_penalty}"
             f"_rw{args.acr_reverse_weight}"
+        )
+    elif args.local_identity_rescore:
+        method_tag = (
+            f"lir_topk{args.lir_topk}_r{args.lir_radius}_pw{args.lir_profile_weight}"
+            f"_nw{args.lir_neighbor_weight}_rw{args.lir_reverse_weight}"
         )
     elif args.confusion_pair_rerank:
         method_tag = (
@@ -753,6 +871,14 @@ if __name__ == "__main__":
     parser.add_argument("--acr_radius", default=0.6, type=float, help="target-space clustering radius normalized by target threshold")
     parser.add_argument("--acr_fallback_penalty", default=0.05, type=float, help="penalty for falling back to the source-specific best candidate instead of a shared unique slot")
     parser.add_argument("--acr_reverse_weight", default=0.1, type=float, help="reverse-cycle penalty weight inside assignment candidate scoring")
+    parser.add_argument("--local_identity_rescore", action="store_true", default=False, help="rerank top-k candidates using local identity relation signatures")
+    parser.add_argument("--lir_topk", default=5, type=int, help="number of top candidates retained for local identity rescoring")
+    parser.add_argument("--lir_radius", default=2, type=int, help="local neighborhood radius for identity relation signatures")
+    parser.add_argument("--lir_offset_step", default=1, type=int, help="sampling stride for local identity offsets")
+    parser.add_argument("--lir_min_offsets", default=4, type=int, help="minimum valid offsets required to trust local identity rescoring")
+    parser.add_argument("--lir_profile_weight", default=0.2, type=float, help="weight for center-to-neighbor profile agreement")
+    parser.add_argument("--lir_neighbor_weight", default=0.2, type=float, help="weight for aligned neighbor feature agreement")
+    parser.add_argument("--lir_reverse_weight", default=0.05, type=float, help="optional reverse-cycle penalty in local identity rescoring")
     args = parser.parse_args()
     
     torch.backends.cudnn.enabled = True
