@@ -20,6 +20,7 @@ warnings.filterwarnings('ignore')
 import numpy as np
 from scipy.spatial.distance import cosine
 from scipy.optimize import linear_sum_assignment
+import csv
 
 
 def build_offset_list(radius, step):
@@ -92,6 +93,24 @@ def reverse_cycle_distance(src_ft, trg_ft, src_x, src_y, cand_x, cand_y, src_thr
     return float(reverse_dist / max(src_threshold, 1e-6))
 
 
+def reverse_cycle_distance_batch(src_ft, trg_ft, src_x, src_y, cand_x, cand_y, src_threshold):
+    _, channels, src_h, src_w = src_ft.shape
+    src_matrix = src_ft.view(channels, -1).transpose(0, 1).float()
+    src_matrix = F.normalize(src_matrix, dim=1)
+
+    trg_vecs = trg_ft[0, :, cand_y, cand_x].transpose(0, 1).float()
+    trg_vecs = F.normalize(trg_vecs, dim=1)
+
+    reverse_scores = torch.mm(src_matrix, trg_vecs.transpose(0, 1))
+    rev_idx = torch.argmax(reverse_scores, dim=0)
+    rev_y = torch.div(rev_idx, src_w, rounding_mode='floor')
+    rev_x = rev_idx % src_w
+    reverse_dist = torch.sqrt(
+        (rev_x.float() - float(src_x)) ** 2 + (rev_y.float() - float(src_y)) ** 2
+    )
+    return reverse_dist / max(float(src_threshold), 1e-6)
+
+
 def confusion_local_rerank(src_ft, trg_ft, src_point, candidate_list, src_threshold, args):
     if not candidate_list:
         return src_point[0], src_point[1]
@@ -131,6 +150,7 @@ def local_identity_rescore(src_ft, trg_ft, src_point, score_vec, width, src_thre
     cand_y = torch.div(top_idx, width, rounding_mode='floor')
     cand_x = top_idx % width
 
+    device = score_vec.device
     _, channels, src_h, src_w = src_ft.shape
     _, _, trg_h, trg_w = trg_ft.shape
     src_x = int(src_point[0])
@@ -139,79 +159,95 @@ def local_identity_rescore(src_ft, trg_ft, src_point, score_vec, width, src_thre
     if not offsets:
         return int(cand_x[0].item()), int(cand_y[0].item())
 
-    src_center = F.normalize(src_ft[0, :, src_y, src_x].float().view(1, channels), dim=1)
-    src_valid_x = []
-    src_valid_y = []
-    src_valid_offsets = []
-    for dx, dy in offsets:
-        sx = src_x + dx
-        sy = src_y + dy
-        if 0 <= sx < src_w and 0 <= sy < src_h:
-            src_valid_x.append(sx)
-            src_valid_y.append(sy)
-            src_valid_offsets.append((dx, dy))
+    offsets_tensor = torch.tensor(offsets, device=device, dtype=torch.long)
+    offset_x = offsets_tensor[:, 0]
+    offset_y = offsets_tensor[:, 1]
 
-    if len(src_valid_offsets) < int(args.lir_min_offsets):
+    src_nb_x = src_x + offset_x
+    src_nb_y = src_y + offset_y
+    src_valid_mask = (
+        (src_nb_x >= 0)
+        & (src_nb_x < src_w)
+        & (src_nb_y >= 0)
+        & (src_nb_y < src_h)
+    )
+    if int(src_valid_mask.sum().item()) < int(args.lir_min_offsets):
         return int(cand_x[0].item()), int(cand_y[0].item())
 
-    src_nb = src_ft[0, :, src_valid_y, src_valid_x].transpose(0, 1).float()
+    src_nb_x = src_nb_x[src_valid_mask]
+    src_nb_y = src_nb_y[src_valid_mask]
+    valid_offset_x = offset_x[src_valid_mask]
+    valid_offset_y = offset_y[src_valid_mask]
+
+    src_center = F.normalize(src_ft[0, :, src_y, src_x].float().view(1, channels), dim=1)
+    src_nb = src_ft[0, :, src_nb_y, src_nb_x].transpose(0, 1).float()
     src_nb = F.normalize(src_nb, dim=1)
     src_profile = torch.mm(src_nb, src_center.transpose(0, 1)).squeeze(1)
 
-    best_score = None
-    best_xy = (int(cand_x[0].item()), int(cand_y[0].item()))
-    for cand_idx in range(k):
-        tx = int(cand_x[cand_idx].item())
-        ty = int(cand_y[cand_idx].item())
+    cand_x_long = cand_x.long()
+    cand_y_long = cand_y.long()
+    trg_nb_x = cand_x_long.unsqueeze(1) + valid_offset_x.unsqueeze(0)
+    trg_nb_y = cand_y_long.unsqueeze(1) + valid_offset_y.unsqueeze(0)
+    trg_valid_mask = (
+        (trg_nb_x >= 0)
+        & (trg_nb_x < trg_w)
+        & (trg_nb_y >= 0)
+        & (trg_nb_y < trg_h)
+    )
+    valid_counts = trg_valid_mask.sum(dim=1)
+    enough_mask = valid_counts >= int(args.lir_min_offsets)
 
-        valid_ids = []
-        trg_valid_x = []
-        trg_valid_y = []
-        for offset_idx, (dx, dy) in enumerate(src_valid_offsets):
-            nx = tx + dx
-            ny = ty + dy
-            if 0 <= nx < trg_w and 0 <= ny < trg_h:
-                valid_ids.append(offset_idx)
-                trg_valid_x.append(nx)
-                trg_valid_y.append(ny)
+    trg_nb_x_safe = trg_nb_x.clamp(0, trg_w - 1)
+    trg_nb_y_safe = trg_nb_y.clamp(0, trg_h - 1)
 
-        if len(valid_ids) < int(args.lir_min_offsets):
-            profile_agreement = 0.0
-            neighbor_agreement = 0.0
-        else:
-            valid_idx_tensor = torch.tensor(valid_ids, device=src_profile.device, dtype=torch.long)
-            src_profile_valid = src_profile.index_select(0, valid_idx_tensor)
-            src_nb_valid = src_nb.index_select(0, valid_idx_tensor)
+    trg_center = trg_ft[0, :, cand_y_long, cand_x_long].transpose(0, 1).float()
+    trg_center = F.normalize(trg_center, dim=1)
 
-            trg_center = F.normalize(trg_ft[0, :, ty, tx].float().view(1, channels), dim=1)
-            trg_nb = trg_ft[0, :, trg_valid_y, trg_valid_x].transpose(0, 1).float()
-            trg_nb = F.normalize(trg_nb, dim=1)
-            trg_profile = torch.mm(trg_nb, trg_center.transpose(0, 1)).squeeze(1)
+    trg_nb = trg_ft[0, :, trg_nb_y_safe.reshape(-1), trg_nb_x_safe.reshape(-1)]
+    trg_nb = trg_nb.transpose(0, 1).reshape(k, -1, channels).float()
+    trg_nb = F.normalize(trg_nb, dim=2)
 
-            profile_agreement = float(
-                F.cosine_similarity(
-                    src_profile_valid.view(1, -1),
-                    trg_profile.view(1, -1),
-                    dim=1,
-                ).item()
-            )
-            neighbor_agreement = float(torch.mean(torch.sum(src_nb_valid * trg_nb, dim=1)).item())
+    trg_profile = torch.sum(trg_nb * trg_center.unsqueeze(1), dim=2)
 
-        reverse_penalty = 0.0
-        if args.lir_reverse_weight > 0:
-            reverse_penalty = reverse_cycle_distance(src_ft, trg_ft, src_x, src_y, tx, ty, src_threshold)
+    src_profile_expand = src_profile.unsqueeze(0).expand(k, -1)
+    src_nb_expand = src_nb.unsqueeze(0).expand(k, -1, -1)
+    mask_f = trg_valid_mask.float()
 
-        combined = (
-            float(top_vals[cand_idx].item())
-            + float(args.lir_profile_weight) * profile_agreement
-            + float(args.lir_neighbor_weight) * neighbor_agreement
-            - float(args.lir_reverse_weight) * reverse_penalty
+    src_profile_masked = src_profile_expand * mask_f
+    trg_profile_masked = trg_profile * mask_f
+    profile_num = torch.sum(src_profile_masked * trg_profile_masked, dim=1)
+    profile_den = (
+        torch.linalg.norm(src_profile_masked, dim=1) * torch.linalg.norm(trg_profile_masked, dim=1)
+    ).clamp_min(1e-6)
+    profile_agreement = profile_num / profile_den
+
+    neighbor_dot = torch.sum(src_nb_expand * trg_nb, dim=2)
+    neighbor_agreement = torch.sum(neighbor_dot * mask_f, dim=1) / valid_counts.clamp_min(1).float()
+
+    profile_agreement = torch.where(enough_mask, profile_agreement, torch.zeros_like(profile_agreement))
+    neighbor_agreement = torch.where(enough_mask, neighbor_agreement, torch.zeros_like(neighbor_agreement))
+
+    if args.lir_reverse_weight > 0:
+        reverse_penalty = reverse_cycle_distance_batch(
+            src_ft,
+            trg_ft,
+            src_x,
+            src_y,
+            cand_x_long,
+            cand_y_long,
+            src_threshold,
         )
-        if best_score is None or combined > best_score:
-            best_score = combined
-            best_xy = (tx, ty)
+    else:
+        reverse_penalty = torch.zeros(k, device=device, dtype=torch.float32)
 
-    return best_xy
+    combined = (
+        top_vals.float()
+        + float(args.lir_profile_weight) * profile_agreement
+        + float(args.lir_neighbor_weight) * neighbor_agreement
+        - float(args.lir_reverse_weight) * reverse_penalty
+    )
+    best_idx = int(torch.argmax(combined).item())
+    return int(cand_x[best_idx].item()), int(cand_y[best_idx].item())
 
 
 def build_pair_candidate_records(src_ft, trg_ft, src_points, src_threshold, topk, reverse_weight):
@@ -610,6 +646,7 @@ def main(args):
     mean_point_sum=0
     
     result={"image":{},"point":{}}
+    point_records = []
     
     print("Category numbers: %s"%len(all_cats))
     for cat in all_cats:
@@ -694,6 +731,7 @@ def main(args):
             trg_bndbox = data['trg_bndbox']
             src_threshold = max(src_bndbox[3] - src_bndbox[1], src_bndbox[2] - src_bndbox[0])
             threshold = max(trg_bndbox[3] - trg_bndbox[1], trg_bndbox[2] - trg_bndbox[0])
+            pair_name = os.path.splitext(json_path)[0]
 
             total = 0
             correct = 0
@@ -769,10 +807,33 @@ def main(args):
 
                 trg_list.append([pred_x, pred_y])
                 dist = ((pred_x - trg_point[0]) ** 2 + (pred_y - trg_point[1]) ** 2) ** 0.5
+                is_correct = int((dist / threshold) <= 0.1)
                 if (dist / threshold) <= 0.1:
                     correct += 1
                     cat_correct += 1
                     all_correct += 1
+                if args.save_point_records:
+                    point_records.append(
+                        {
+                            "category": cat,
+                            "pair_name": pair_name,
+                            "src_imname": data["src_imname"],
+                            "trg_imname": data["trg_imname"],
+                            "kp_idx": idx,
+                            "src_x": int(src_point[0]),
+                            "src_y": int(src_point[1]),
+                            "trg_x": int(trg_point[0]),
+                            "trg_y": int(trg_point[1]),
+                            "pred_x": int(pred_x),
+                            "pred_y": int(pred_y),
+                            "dist": float(dist),
+                            "norm_dist": float(dist / max(float(threshold), 1e-6)),
+                            "correct": is_correct,
+                            "src_threshold": float(src_threshold),
+                            "trg_threshold": float(threshold),
+                            "method_tag": "runtime",
+                        }
+                    )
 
             cat_pck.append(correct / total)
             
@@ -824,6 +885,34 @@ def main(args):
         method_tag = f"clr_topk{args.clr_topk}_r{args.clr_radius}_sw{args.clr_structure_weight}_rw{args.clr_reverse_weight}"
     with open(os.path.join(save_dir, f't{args.t}_b{args.k}_e{args.ensemble_size}_{method_tag}.json'), 'w+') as json_file:
         json.dump(result, json_file, indent=4, ensure_ascii=False)
+    if args.save_point_records:
+        records_dir = args.point_records_dir if args.point_records_dir else save_dir
+        os.makedirs(records_dir, exist_ok=True)
+        records_path = os.path.join(records_dir, f"per_point_records_{method_tag}.csv")
+        fieldnames = [
+            "category",
+            "pair_name",
+            "src_imname",
+            "trg_imname",
+            "kp_idx",
+            "src_x",
+            "src_y",
+            "trg_x",
+            "trg_y",
+            "pred_x",
+            "pred_y",
+            "dist",
+            "norm_dist",
+            "correct",
+            "src_threshold",
+            "trg_threshold",
+            "method_tag",
+        ]
+        with open(records_path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(point_records)
+        print(f"Saved point records to: {records_path}")
 
 
 if __name__ == "__main__":
@@ -879,6 +968,8 @@ if __name__ == "__main__":
     parser.add_argument("--lir_profile_weight", default=0.2, type=float, help="weight for center-to-neighbor profile agreement")
     parser.add_argument("--lir_neighbor_weight", default=0.2, type=float, help="weight for aligned neighbor feature agreement")
     parser.add_argument("--lir_reverse_weight", default=0.05, type=float, help="optional reverse-cycle penalty in local identity rescoring")
+    parser.add_argument("--save_point_records", action="store_true", default=False, help="save per-point prediction records for downstream method-delta analysis")
+    parser.add_argument("--point_records_dir", type=str, default="", help="optional output directory for saved per-point records")
     args = parser.parse_args()
     
     torch.backends.cudnn.enabled = True
