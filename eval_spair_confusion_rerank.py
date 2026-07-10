@@ -351,7 +351,9 @@ def main(args):
             h = trg_ft.shape[-2]
             w = trg_ft.shape[-1]
 
+            src_bndbox = data['src_bndbox']
             trg_bndbox = data['trg_bndbox']
+            src_threshold = max(src_bndbox[3] - src_bndbox[1], src_bndbox[2] - src_bndbox[0])
             threshold = max(trg_bndbox[3] - trg_bndbox[1], trg_bndbox[2] - trg_bndbox[0])
 
             total = 0
