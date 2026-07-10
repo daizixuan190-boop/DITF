@@ -83,18 +83,24 @@ def mean_or_none(values: list[float]) -> float | None:
 
 
 def rate(records: list[dict[str, Any]], key: str) -> float | None:
-    if not records:
+    values = [record[key] for record in records if key in record and record[key] is not None]
+    if not values:
         return None
-    return float(np.mean([float(record[key]) for record in records]))
+    return float(np.mean([float(value) for value in values]))
+
+
+def numeric_mean(records: list[dict[str, Any]], key: str) -> float | None:
+    values = [float(record[key]) for record in records if key in record and record[key] is not None]
+    return mean_or_none(values)
 
 
 def summarize_group(records: list[dict[str, Any]]) -> dict[str, Any]:
     return {
         "count": len(records),
-        "mean_best_other_error_cosine": mean_or_none([float(record["best_other_error_cosine"]) for record in records]),
-        "mean_best_other_centroid_cosine": mean_or_none([float(record["best_other_centroid_cosine"]) for record in records]),
-        "mean_nearest_other_to_pred_norm_dist": mean_or_none([float(record["nearest_other_to_pred_norm_dist"]) for record in records]),
-        "mean_nearest_other_to_centroid_norm_dist": mean_or_none([float(record["nearest_other_to_centroid_norm_dist"]) for record in records]),
+        "mean_best_other_error_cosine": numeric_mean(records, "best_other_error_cosine"),
+        "mean_best_other_centroid_cosine": numeric_mean(records, "best_other_centroid_cosine"),
+        "mean_nearest_other_to_pred_norm_dist": numeric_mean(records, "nearest_other_to_pred_norm_dist"),
+        "mean_nearest_other_to_centroid_norm_dist": numeric_mean(records, "nearest_other_to_centroid_norm_dist"),
         "pred_closer_to_other_than_gt_rate": rate(records, "pred_closer_to_other_than_gt"),
         "centroid_closer_to_other_than_gt_rate": rate(records, "centroid_closer_to_other_than_gt"),
         "best_other_error_cosine_gt_0_9_rate": rate(records, "best_other_error_cosine_gt_0_9"),
