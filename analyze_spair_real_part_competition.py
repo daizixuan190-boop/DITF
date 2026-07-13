@@ -99,6 +99,16 @@ def get_pair_scalar_fields(data: dict[str, Any]) -> dict[str, Any]:
     return scalar_fields
 
 
+def resolve_pair_json_path(test_path: str, pair_name: str) -> str:
+    direct_path = os.path.join(test_path, pair_name)
+    if os.path.exists(direct_path):
+        return direct_path
+    json_path = os.path.join(test_path, f"{pair_name}.json")
+    if os.path.exists(json_path):
+        return json_path
+    raise FileNotFoundError(f"Missing pair annotation for pair_name={pair_name}")
+
+
 def merge_tags(records: list[dict[str, Any]], tag_records: list[dict[str, Any]], tag_column: str):
     tag_map = {tuple(record[key] for key in MERGE_KEYS): record for record in tag_records}
     observed_values = set()
@@ -244,7 +254,8 @@ def main():
 
         output_dict = torch.load(feat_file, map_location="cpu", weights_only=True)
         ada_dict = torch.load(ada_file, map_location="cpu", weights_only=True)
-        with open(os.path.join(test_path, pair_name), "r", encoding="utf-8") as f:
+        pair_json_path = resolve_pair_json_path(test_path, pair_name)
+        with open(pair_json_path, "r", encoding="utf-8") as f:
             data = json.load(f)
 
         src_imname = data["src_imname"]
