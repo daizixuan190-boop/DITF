@@ -12,9 +12,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from analyze_spair_real_part_competition import (
-    MERGE_KEYS,
     batch_patch_descriptors,
-    filter_records,
     load_csv,
     resolve_pair_json_path,
     safe_mean,
@@ -23,6 +21,15 @@ from analyze_spair_real_part_competition import (
 )
 from analyze_spair_token_residuals import build_post_feature, ensure_dir
 from estimate_spair_matching_ceiling import maybe_apply_post_calibration
+
+
+MERGE_KEYS = [
+    "category",
+    "pair_name",
+    "src_imname",
+    "trg_imname",
+    "kp_idx",
+]
 
 
 def parse_args():
@@ -69,6 +76,28 @@ def parse_scalar(value: str) -> Any:
     if math.isfinite(num) and abs(num - round(num)) < 1e-12:
         return int(round(num))
     return num
+
+
+def filter_competition_records(records: list[dict[str, Any]], max_pairs_per_cat: int) -> list[dict[str, Any]]:
+    if max_pairs_per_cat <= 0:
+        return records
+    by_cat: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for record in records:
+        by_cat[str(record["category"])].append(record)
+
+    limited: list[dict[str, Any]] = []
+    for _, subset in by_cat.items():
+        pair_seen = []
+        kept_pairs = set()
+        for record in subset:
+            pair_name = str(record["pair_name"])
+            if pair_name not in kept_pairs:
+                if len(pair_seen) >= max_pairs_per_cat:
+                    continue
+                pair_seen.append(pair_name)
+                kept_pairs.add(pair_name)
+            limited.append(record)
+    return limited
 
 
 def summarize_subset(records: list[dict[str, Any]], radii: list[int]) -> dict[str, Any]:
@@ -153,7 +182,7 @@ def main():
     device = torch.device(args.device if args.device == "cpu" or torch.cuda.is_available() else "cpu")
     print(f"Using analysis device: {device}")
 
-    competition_records = filter_records(load_csv(args.competition_csv), args)
+    competition_records = filter_competition_records(load_csv(args.competition_csv), args.max_pairs_per_cat)
     if not competition_records:
         raise RuntimeError("No competition records selected. Check competition_csv and filters.")
 
