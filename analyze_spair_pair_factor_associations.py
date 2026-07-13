@@ -316,6 +316,8 @@ def field_effect_summary(group_summaries: dict[str, dict[str, Any]], min_group_p
             "cross_margin_range": None,
             "hardest_group": None,
             "easiest_group": None,
+            "worst_margin_group": None,
+            "best_margin_group": None,
         }
 
     def failure_rate(summary: dict[str, Any]) -> float:
