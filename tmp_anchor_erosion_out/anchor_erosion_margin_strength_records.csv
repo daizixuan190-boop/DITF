@@ -1,0 +1,11 @@
+abs_margin_a,abs_margin_quantile,anchored_strength_quantile,best_other_idx_center,category,count_a,count_b,delta_cross_gt_score,delta_cross_margin,delta_cross_rival_score,delta_failure_rate,failure_gt_drop_more_than_rival,gt_drop_more_than_rival,is_anchored,kp_idx,margin_regime,mean_cross_margin_a,positive_margin_quantile,positive_margin_strength,preferential_gt_damage,scale_a,scale_b
+0.2,"abs_Q3(0.12,0.3]","anchored_Q3(0.186667,0.3]",2,train,20,20,-0.08,-0.05,-0.03,0.03,1,1,1,1,anchored,0.2,"pos_Q3(0.16,0.3]",0.2,1,0,2
+0.12,"abs_Q2(0.08,0.12]","anchored_Q2(0.11,0.186667]",3,train,18,18,-0.05,-0.03,-0.02,0.02,1,1,1,1,anchored,0.12,"pos_Q2(0.07,0.16]",0.12,1,0,2
+0.06,"abs_Q1(0.01,0.08]","anchored_Q1(0.06,0.11]",3,train,22,22,-0.02,-0.01,-0.01,0.01,1,1,1,2,anchored,0.06,"pos_Q1(0.01,0.07]",0.06,1,0,2
+0.03,"abs_Q1(0.01,0.08]",not_anchored,4,train,25,25,-0.01,0,-0.01,0,0,0,0,2,near_boundary,0.03,"pos_Q1(0.01,0.07]",0.03,0,0,2
+0.08,"abs_Q1(0.01,0.08]",not_anchored,4,train,21,21,-0.01,0.01,-0.02,-0.01,0,0,0,3,already_flipped,-0.08,unknown,,0,0,2
+0.3,"abs_Q3(0.12,0.3]","anchored_Q3(0.186667,0.3]",5,train,19,19,-0.1,-0.06,-0.04,0.04,1,1,1,4,anchored,0.3,"pos_Q3(0.16,0.3]",0.3,1,1,2
+0.18,"abs_Q3(0.12,0.3]","anchored_Q2(0.11,0.186667]",6,train,17,17,-0.07,-0.04,-0.03,0.03,1,1,1,5,anchored,0.18,"pos_Q3(0.16,0.3]",0.18,1,1,2
+0.09,"abs_Q2(0.08,0.12]","anchored_Q1(0.06,0.11]",7,train,16,16,-0.03,-0.01,-0.02,0.01,1,1,1,6,anchored,0.09,"pos_Q2(0.07,0.16]",0.09,1,1,2
+0.01,"abs_Q1(0.01,0.08]",not_anchored,8,train,15,15,0,0.01,-0.01,-0.01,0,0,0,7,near_boundary,0.01,"pos_Q1(0.01,0.07]",0.01,0,1,2
+0.12,"abs_Q2(0.08,0.12]",not_anchored,9,train,14,14,-0.02,0.01,-0.03,-0.02,0,0,0,8,already_flipped,-0.12,unknown,,0,1,2
