@@ -1,0 +1,5 @@
+__transition_key__,best_other_idx_center,category,cohort_name,count,count_a,count_b,cross_view_only_erosion,delta_cross_margin,erosion_case,failure_rate,kp_idx,margin_regime,mean_best_other_trg_norm_dist,mean_center_margin,mean_cross_gt_score,mean_cross_margin,mean_cross_rival_score,mean_occlusion,mean_src_rival_sim,mean_trg_rival_sim,mean_truncation,mean_viewpoint_variation,scale_a,scale_b,scale_value,source_dominant_erosion,target_more_collapsed_rate
+0->2,1,cat,source_dominant_erosion,2,20,20,0,-0.04,1,0.5,0,anchored,0.75,0.08499999999999999,0.615,0.08499999999999999,0.53,0.0,0.345,0.175,0.0,0.0,0,2,0,1,0.0
+0->2,3,cat,cross_view_only_erosion,2,18,18,1,-0.05,1,0.5,2,anchored,1.05,0.135,0.755,0.135,0.62,1.0,0.11499999999999999,0.095,1.0,1.0,0,2,0,0,0.0
+1->2,5,cat,source_dominant_erosion,2,16,16,0,-0.03,1,0.5,4,near_boundary,0.9,0.045,0.575,0.045,0.53,0.0,0.305,0.185,1.0,0.0,1,2,1,1,0.0
+1->2,7,cat,cross_view_only_erosion,2,14,14,1,-0.06,1,0.5,6,anchored,1.25,0.155,0.785,0.155,0.63,1.0,0.10500000000000001,0.08499999999999999,0.0,1.0,1,2,1,0,0.0

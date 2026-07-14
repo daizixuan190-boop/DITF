@@ -1,0 +1,5 @@
+﻿category,kp_idx,best_other_idx_center,scale_a,scale_b,count_a,count_b,margin_regime,erosion_case,source_dominant_erosion,cross_view_only_erosion,delta_cross_margin
+cat,0,1,0,2,20,20,anchored,1,1,0,-0.04
+cat,2,3,0,2,18,18,anchored,1,0,1,-0.05
+cat,4,5,1,2,16,16,near_boundary,1,1,0,-0.03
+cat,6,7,1,2,14,14,anchored,1,0,1,-0.06

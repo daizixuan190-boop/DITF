@@ -1,0 +1,291 @@
+{
+  "num_transitions": 4,
+  "num_baseline_groups": 4,
+  "num_annotated_records": 4,
+  "cohort_keys": [
+    "source_dominant_erosion",
+    "cross_view_only_erosion"
+  ],
+  "context_radius": 0,
+  "scale_field": "scale_variation",
+  "factor_fields_used": [
+    "occlusion",
+    "truncation",
+    "viewpoint_variation"
+  ],
+  "cohorts": {
+    "source_dominant_erosion": {
+      "count": 2,
+      "weighted_support_sum": 36,
+      "transition_distribution": {
+        "0->2": 0.5555555555555556,
+        "1->2": 0.4444444444444444
+      },
+      "margin_regime_distribution": {
+        "anchored": 0.5555555555555556,
+        "near_boundary": 0.4444444444444444
+      },
+      "baseline_features": {
+        "failure_rate": 0.5,
+        "mean_center_margin": 0.06722222222222222,
+        "mean_best_other_trg_norm_dist": 0.8166666666666667,
+        "mean_src_rival_sim": 0.3272222222222222,
+        "mean_trg_rival_sim": 0.17944444444444443,
+        "mean_cross_gt_score": 0.5972222222222222,
+        "mean_cross_rival_score": 0.53,
+        "mean_cross_margin": 0.06722222222222222,
+        "target_more_collapsed_rate": 0.0,
+        "mean_occlusion": 0.0,
+        "mean_truncation": 0.4444444444444444,
+        "mean_viewpoint_variation": 0.0
+      }
+    },
+    "cross_view_only_erosion": {
+      "count": 2,
+      "weighted_support_sum": 32,
+      "transition_distribution": {
+        "0->2": 0.5625,
+        "1->2": 0.4375
+      },
+      "margin_regime_distribution": {
+        "anchored": 1.0
+      },
+      "baseline_features": {
+        "failure_rate": 0.5,
+        "mean_center_margin": 0.14375,
+        "mean_best_other_trg_norm_dist": 1.1375000000000002,
+        "mean_src_rival_sim": 0.110625,
+        "mean_trg_rival_sim": 0.090625,
+        "mean_cross_gt_score": 0.768125,
+        "mean_cross_rival_score": 0.624375,
+        "mean_cross_margin": 0.14375,
+        "target_more_collapsed_rate": 0.0,
+        "mean_occlusion": 1.0,
+        "mean_truncation": 0.5625,
+        "mean_viewpoint_variation": 1.0
+      }
+    }
+  },
+  "pairwise_comparisons": {
+    "source_dominant_erosion__vs__cross_view_only_erosion": {
+      "cohort_a": {
+        "count": 2,
+        "weighted_support_sum": 36,
+        "transition_distribution": {
+          "0->2": 0.5555555555555556,
+          "1->2": 0.4444444444444444
+        },
+        "margin_regime_distribution": {
+          "anchored": 0.5555555555555556,
+          "near_boundary": 0.4444444444444444
+        },
+        "baseline_features": {
+          "failure_rate": 0.5,
+          "mean_center_margin": 0.06722222222222222,
+          "mean_best_other_trg_norm_dist": 0.8166666666666667,
+          "mean_src_rival_sim": 0.3272222222222222,
+          "mean_trg_rival_sim": 0.17944444444444443,
+          "mean_cross_gt_score": 0.5972222222222222,
+          "mean_cross_rival_score": 0.53,
+          "mean_cross_margin": 0.06722222222222222,
+          "target_more_collapsed_rate": 0.0,
+          "mean_occlusion": 0.0,
+          "mean_truncation": 0.4444444444444444,
+          "mean_viewpoint_variation": 0.0
+        }
+      },
+      "cohort_b": {
+        "count": 2,
+        "weighted_support_sum": 32,
+        "transition_distribution": {
+          "0->2": 0.5625,
+          "1->2": 0.4375
+        },
+        "margin_regime_distribution": {
+          "anchored": 1.0
+        },
+        "baseline_features": {
+          "failure_rate": 0.5,
+          "mean_center_margin": 0.14375,
+          "mean_best_other_trg_norm_dist": 1.1375000000000002,
+          "mean_src_rival_sim": 0.110625,
+          "mean_trg_rival_sim": 0.090625,
+          "mean_cross_gt_score": 0.768125,
+          "mean_cross_rival_score": 0.624375,
+          "mean_cross_margin": 0.14375,
+          "target_more_collapsed_rate": 0.0,
+          "mean_occlusion": 1.0,
+          "mean_truncation": 0.5625,
+          "mean_viewpoint_variation": 1.0
+        }
+      },
+      "all_feature_gaps": [
+        {
+          "feature": "failure_rate",
+          "weighted_mean_a": 0.5,
+          "weighted_mean_b": 0.5,
+          "gap_a_minus_b": 0.0,
+          "pooled_std": 0.0,
+          "standardized_gap": null
+        },
+        {
+          "feature": "mean_center_margin",
+          "weighted_mean_a": 0.06722222222222222,
+          "weighted_mean_b": 0.14375,
+          "gap_a_minus_b": -0.07652777777777776,
+          "pooled_std": 0.01570826579217231,
+          "standardized_gap": -4.871815819153813
+        },
+        {
+          "feature": "mean_best_other_trg_norm_dist",
+          "weighted_mean_a": 0.8166666666666667,
+          "weighted_mean_b": 1.1375000000000002,
+          "gap_a_minus_b": -0.3208333333333335,
+          "pooled_std": 0.08774766536938619,
+          "standardized_gap": -3.656317600961123
+        },
+        {
+          "feature": "mean_src_rival_sim",
+          "weighted_mean_a": 0.3272222222222222,
+          "weighted_mean_b": 0.110625,
+          "gap_a_minus_b": 0.2165972222222222,
+          "pooled_std": 0.01448570162945277,
+          "standardized_gap": 14.952484026167578
+        },
+        {
+          "feature": "mean_trg_rival_sim",
+          "weighted_mean_a": 0.17944444444444443,
+          "weighted_mean_b": 0.090625,
+          "gap_a_minus_b": 0.08881944444444444,
+          "pooled_std": 0.0049649135453042606,
+          "standardized_gap": 17.889424183115636
+        },
+        {
+          "feature": "mean_cross_gt_score",
+          "weighted_mean_a": 0.5972222222222222,
+          "weighted_mean_b": 0.768125,
+          "gap_a_minus_b": -0.17090277777777774,
+          "pooled_std": 0.01755770633361691,
+          "standardized_gap": -9.733775843519963
+        },
+        {
+          "feature": "mean_cross_rival_score",
+          "weighted_mean_a": 0.53,
+          "weighted_mean_b": 0.624375,
+          "gap_a_minus_b": -0.09437499999999999,
+          "pooled_std": 0.0035078038001005733,
+          "standardized_gap": -26.90429835251736
+        },
+        {
+          "feature": "mean_cross_margin",
+          "weighted_mean_a": 0.06722222222222222,
+          "weighted_mean_b": 0.14375,
+          "gap_a_minus_b": -0.07652777777777776,
+          "pooled_std": 0.01570826579217231,
+          "standardized_gap": -4.871815819153813
+        },
+        {
+          "feature": "target_more_collapsed_rate",
+          "weighted_mean_a": 0.0,
+          "weighted_mean_b": 0.0,
+          "gap_a_minus_b": 0.0,
+          "pooled_std": 0.0,
+          "standardized_gap": null
+        },
+        {
+          "feature": "mean_occlusion",
+          "weighted_mean_a": 0.0,
+          "weighted_mean_b": 1.0,
+          "gap_a_minus_b": -1.0,
+          "pooled_std": 0.0,
+          "standardized_gap": null
+        },
+        {
+          "feature": "mean_truncation",
+          "weighted_mean_a": 0.4444444444444444,
+          "weighted_mean_b": 0.5625,
+          "gap_a_minus_b": -0.11805555555555558,
+          "pooled_std": 0.49649135453042564,
+          "standardized_gap": -0.23777968030724486
+        },
+        {
+          "feature": "mean_viewpoint_variation",
+          "weighted_mean_a": 0.0,
+          "weighted_mean_b": 1.0,
+          "gap_a_minus_b": -1.0,
+          "pooled_std": 0.0,
+          "standardized_gap": null
+        }
+      ],
+      "top_separative_features": [
+        {
+          "feature": "mean_cross_rival_score",
+          "weighted_mean_a": 0.53,
+          "weighted_mean_b": 0.624375,
+          "gap_a_minus_b": -0.09437499999999999,
+          "pooled_std": 0.0035078038001005733,
+          "standardized_gap": -26.90429835251736
+        },
+        {
+          "feature": "mean_trg_rival_sim",
+          "weighted_mean_a": 0.17944444444444443,
+          "weighted_mean_b": 0.090625,
+          "gap_a_minus_b": 0.08881944444444444,
+          "pooled_std": 0.0049649135453042606,
+          "standardized_gap": 17.889424183115636
+        },
+        {
+          "feature": "mean_src_rival_sim",
+          "weighted_mean_a": 0.3272222222222222,
+          "weighted_mean_b": 0.110625,
+          "gap_a_minus_b": 0.2165972222222222,
+          "pooled_std": 0.01448570162945277,
+          "standardized_gap": 14.952484026167578
+        },
+        {
+          "feature": "mean_cross_gt_score",
+          "weighted_mean_a": 0.5972222222222222,
+          "weighted_mean_b": 0.768125,
+          "gap_a_minus_b": -0.17090277777777774,
+          "pooled_std": 0.01755770633361691,
+          "standardized_gap": -9.733775843519963
+        },
+        {
+          "feature": "mean_center_margin",
+          "weighted_mean_a": 0.06722222222222222,
+          "weighted_mean_b": 0.14375,
+          "gap_a_minus_b": -0.07652777777777776,
+          "pooled_std": 0.01570826579217231,
+          "standardized_gap": -4.871815819153813
+        },
+        {
+          "feature": "mean_cross_margin",
+          "weighted_mean_a": 0.06722222222222222,
+          "weighted_mean_b": 0.14375,
+          "gap_a_minus_b": -0.07652777777777776,
+          "pooled_std": 0.01570826579217231,
+          "standardized_gap": -4.871815819153813
+        },
+        {
+          "feature": "mean_best_other_trg_norm_dist",
+          "weighted_mean_a": 0.8166666666666667,
+          "weighted_mean_b": 1.1375000000000002,
+          "gap_a_minus_b": -0.3208333333333335,
+          "pooled_std": 0.08774766536938619,
+          "standardized_gap": -3.656317600961123
+        },
+        {
+          "feature": "mean_truncation",
+          "weighted_mean_a": 0.4444444444444444,
+          "weighted_mean_b": 0.5625,
+          "gap_a_minus_b": -0.11805555555555558,
+          "pooled_std": 0.49649135453042564,
+          "standardized_gap": -0.23777968030724486
+        }
+      ]
+    }
+  },
+  "notes": {
+    "interpretation": "If downstream erosion cohorts already separate on baseline single-scale signatures, then cohort-aware intervention is in principle feasible at inference time. If they do not separate, the cohorts may still be analytically distinct but hard to route with explicit gating."
+  }
+}
