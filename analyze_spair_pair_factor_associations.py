@@ -14,6 +14,7 @@ BASE_EXCLUDE_FIELDS = {
     "pair_name",
     "src_imname",
     "trg_imname",
+    "filename",
     "kp_idx",
     "correct",
     "pred_x",
