@@ -1,0 +1,6 @@
+__transition_key__,best_other_idx_center,bilateral_erosion,category,cohort_name,count_a,count_b,cross_view_only_erosion,delta_cross_gt_score,delta_cross_margin,delta_cross_rival_score,delta_failure_rate,delta_occlusion,delta_src_rival_sim,delta_target_more_collapsed_rate,delta_trg_minus_src_rival_sim,delta_trg_rival_sim,delta_truncation,delta_viewpoint_variation,erosion_case,gt_drop_more_than_rival,kp_idx,margin_regime,mean_occlusion_a,mean_occlusion_b,mean_truncation_a,mean_truncation_b,mean_viewpoint_variation_a,mean_viewpoint_variation_b,scale_a,scale_b,source_dominant_erosion,target_dominant_erosion
+0->2,1,0,cat,source_dominant_erosion,20,20,0,-0.1,-0.05,-0.05,0.08,1.0,0.08,-0.1,-0.07,0.01,0.0,2.0,1,1,0,anchored,0.0,1.0,1.0,1.0,0.0,2.0,0,2,1,0
+0->2,3,0,cat,cross_view_only_erosion,18,18,1,-0.09,-0.06,-0.03,0.05,0.0,0,0,0,0,0.0,2.0,1,1,2,anchored,0.0,0.0,0.0,0.0,0.0,2.0,0,2,0,0
+0->1,9,0,cat,cross_view_only_erosion,12,12,1,-0.03,-0.02,-0.01,0.01,0.0,-0.01,0,0,-0.01,0.0,1.0,1,1,8,anchored,0.0,0.0,0.0,0.0,0.0,1.0,0,1,0,0
+1->2,5,0,cat,target_dominant_erosion,16,16,0,-0.07,-0.03,-0.04,0.03,1.0,0.01,0.07,0.05,0.06,0.0,1.0,1,1,4,near_boundary,1.0,2.0,1.0,1.0,1.0,2.0,1,2,0,1
+0->1,7,1,cat,bilateral_erosion,14,14,0,-0.08,-0.06,-0.02,0.02,1.0,0.05,-0.02,-0.01,0.04,0.0,0.0,1,1,6,anchored,0.0,1.0,2.0,2.0,1.0,1.0,0,1,0,0

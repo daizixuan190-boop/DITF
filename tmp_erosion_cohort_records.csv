@@ -1,0 +1,11 @@
+﻿category,kp_idx,best_other_idx_center,scale_variation,occlusion,truncation,viewpoint_variation
+cat,0,1,0,0,1,0
+cat,0,1,2,1,1,2
+cat,2,3,0,0,0,0
+cat,2,3,2,0,0,2
+cat,4,5,1,1,1,1
+cat,4,5,2,2,1,2
+cat,6,7,0,0,2,1
+cat,6,7,1,1,2,1
+cat,8,9,0,0,0,0
+cat,8,9,1,0,0,1
