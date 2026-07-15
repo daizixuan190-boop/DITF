@@ -59,10 +59,38 @@ def prepare_source_identity_stats(src_ft: torch.Tensor, src_points: list[list[in
     )
     src_vecs = src_ft[0, :, src_xy[:, 1], src_xy[:, 0]].transpose(0, 1).contiguous().float()
     src_vecs = F.normalize(src_vecs, dim=1)
+    if int(src_vecs.shape[0]) <= 1:
+        return src_xy.float(), torch.zeros(src_vecs.shape[0], device=src_ft.device, dtype=torch.float32)
     src_sim = torch.mm(src_vecs, src_vecs.transpose(0, 1))
     src_sim.fill_diagonal_(-1e4)
     max_other_sim, _ = torch.max(src_sim, dim=1)
     return src_xy.float(), max_other_sim
+
+
+def normalize_candidate_record_order(records: list[dict]) -> list[dict]:
+    normalized = []
+    for record in records:
+        order = torch.argsort(record["base_scores"], descending=True)
+        sorted_scores = record["base_scores"][order]
+        sorted_x = record["cand_x"][order]
+        sorted_y = record["cand_y"][order]
+        if int(sorted_scores.numel()) > 1:
+            margin = float((sorted_scores[0] - sorted_scores[1]).item())
+        elif int(sorted_scores.numel()) == 1:
+            margin = float(sorted_scores[0].item())
+        else:
+            margin = 0.0
+        normalized.append(
+            {
+                "src_xy": record["src_xy"],
+                "cand_x": sorted_x,
+                "cand_y": sorted_y,
+                "base_scores": sorted_scores,
+                "anchor_idx": 0 if int(sorted_scores.numel()) > 0 else -1,
+                "margin": margin,
+            }
+        )
+    return normalized
 
 
 def select_anchor_indices(
@@ -89,6 +117,9 @@ def select_anchor_indices(
         anchor_mask[top_idx] = True
 
     anchor_indices = torch.nonzero(anchor_mask, as_tuple=False).squeeze(1)
+    if int(anchor_indices.numel()) > int(args.asr_max_anchors):
+        keep_order = torch.argsort(confidence[anchor_indices], descending=True)[: int(args.asr_max_anchors)]
+        anchor_indices = anchor_indices[keep_order]
     return anchor_indices, confidence, base_risk
 
 
@@ -184,20 +215,30 @@ def anchor_support_rerank(
 
         trg_rel = torch.cdist(cand_xy, current_anchor_xy) / max(float(trg_threshold), 1e-6)
         delta = torch.abs(trg_rel - src_rel.unsqueeze(0))
-        geom_support = torch.exp(-(delta ** 2) / (2.0 * float(args.asr_distance_sigma) ** 2))
+
+        geom_support = torch.exp(-delta / max(float(args.asr_distance_sigma), 1e-6))
         support_bonus = torch.sum(
             geom_support * current_anchor_weights.unsqueeze(0),
             dim=1,
         ) / current_anchor_weights.sum().clamp_min(1e-6)
+        support_bonus = support_bonus - support_bonus.mean()
+
+        support_residual = torch.sum(
+            delta * current_anchor_weights.unsqueeze(0),
+            dim=1,
+        ) / current_anchor_weights.sum().clamp_min(1e-6)
+        residual_advantage = support_residual.mean() - support_residual
 
         overlap = (1.0 - trg_rel / float(args.asr_collision_radius)).clamp(min=0.0)
         collision_penalty = torch.sum(
             overlap * current_anchor_weights.unsqueeze(0),
             dim=1,
         ) / current_anchor_weights.sum().clamp_min(1e-6)
+        collision_penalty = collision_penalty - collision_penalty.mean()
 
         final_scores = base_scores + risk_weight[point_idx] * (
             float(args.asr_support_weight) * support_bonus
+            + float(args.asr_contrast_weight) * residual_advantage
             - float(args.asr_collision_weight) * collision_penalty
         )
 
@@ -309,6 +350,7 @@ def main(args):
                 args.asr_topk,
                 args.asr_base_reverse_weight,
             )
+            pair_records = normalize_candidate_record_order(pair_records)
             src_xy, src_ambiguity = prepare_source_identity_stats(src_ft, src_points)
             predictions, diagnostics = anchor_support_rerank(
                 pair_records,
@@ -399,7 +441,8 @@ def main(args):
     os.makedirs(save_dir, exist_ok=True)
     method_tag = (
         f"asr_topk{args.asr_topk}_aq{args.asr_anchor_quantile}_sw{args.asr_support_weight}"
-        f"_cw{args.asr_collision_weight}_rw{args.asr_base_reverse_weight}"
+        f"_cw{args.asr_collision_weight}_ctw{args.asr_contrast_weight}_ma{args.asr_max_anchors}"
+        f"_rw{args.asr_base_reverse_weight}"
     )
     result_path = os.path.join(save_dir, f"t{args.t}_b{args.k}_e{args.ensemble_size}_{method_tag}.json")
     with open(result_path, "w", encoding="utf-8") as f:
@@ -444,11 +487,13 @@ if __name__ == "__main__":
     parser.add_argument("--asr_base_reverse_weight", default=0.1, type=float, help="reverse-cycle penalty weight used in baseline candidate scoring")
     parser.add_argument("--asr_anchor_quantile", default=0.7, type=float, help="confidence quantile for selecting support anchors")
     parser.add_argument("--asr_min_anchors", default=2, type=int, help="minimum number of support anchors kept per pair")
+    parser.add_argument("--asr_max_anchors", default=6, type=int, help="maximum number of support anchors used per pair")
     parser.add_argument("--asr_margin_quantile", default=0.4, type=float, help="low-margin quantile used to define local ambiguity risk")
     parser.add_argument("--asr_score_quantile", default=0.4, type=float, help="low top-1 score quantile used in the point risk")
     parser.add_argument("--asr_ambiguity_quantile", default=0.7, type=float, help="high source-ambiguity quantile used in the point risk")
     parser.add_argument("--asr_scale_weight", default=0.25, type=float, help="extra global risk contribution from pair-level scale variation")
     parser.add_argument("--asr_support_weight", default=0.2, type=float, help="weight of the anchor-support bonus")
+    parser.add_argument("--asr_contrast_weight", default=0.2, type=float, help="weight of the contrastive residual advantage between top-k candidates")
     parser.add_argument("--asr_collision_weight", default=0.1, type=float, help="weight of the rival-basin collision penalty")
     parser.add_argument("--asr_distance_sigma", default=0.5, type=float, help="bandwidth for normalized source-target distance agreement")
     parser.add_argument("--asr_collision_radius", default=0.6, type=float, help="target-space collision radius normalized by target threshold")
