@@ -52,6 +52,12 @@ def parse_args():
         default=20,
         help="Number of top subgroups / rules to keep in the summary.",
     )
+    parser.add_argument(
+        "--max_rule_candidates",
+        type=int,
+        default=21,
+        help="Maximum number of quantile-based threshold candidates scanned per continuous field.",
+    )
     return parser.parse_args()
 
 
@@ -281,13 +287,33 @@ def quantile_group_summary(records: list[dict[str, Any]], field: str, num_bins: 
     return output
 
 
-def build_threshold_rules(records: list[dict[str, Any]], field: str, min_group_count: int) -> list[dict[str, Any]]:
-    values = sorted({float(record[field]) for record in records if record.get(field) is not None})
+def build_threshold_rules(
+    records: list[dict[str, Any]],
+    field: str,
+    min_group_count: int,
+    max_rule_candidates: int,
+) -> list[dict[str, Any]]:
+    values = [float(record[field]) for record in records if record.get(field) is not None]
     if len(values) < 2:
         return []
 
+    unique_values = unique_sorted(values)
+    if len(unique_values) < 2:
+        return []
+
+    candidate_count = max(3, int(max_rule_candidates))
+    if len(unique_values) <= min(32, candidate_count):
+        thresholds = unique_values[1:-1]
+    else:
+        num_candidates = max(3, candidate_count)
+        raw_thresholds = np.quantile(
+            np.asarray(values, dtype=np.float64),
+            np.linspace(0.0, 1.0, num_candidates + 2)[1:-1],
+        )
+        thresholds = unique_sorted(raw_thresholds.tolist())
+
     rules = []
-    for threshold in values[1:-1]:
+    for threshold in thresholds:
         for direction in ("le", "ge"):
             if direction == "le":
                 subset = [record for record in records if record.get(field) is not None and float(record[field]) <= threshold]
@@ -382,6 +408,7 @@ def main():
 
         numeric_values = [float(record[field]) for record in records if record.get(field) is not None]
         unique_count = len(set(numeric_values))
+        should_build_rules = unique_count > max(8, args.num_bins)
         if unique_count <= max(8, args.num_bins):
             discrete = discrete_group_summary(records, field, args.min_group_count)
             summary["subgroups"][field] = {"type": "discrete_numeric", "groups": discrete}
@@ -391,7 +418,10 @@ def main():
             summary["subgroups"][field] = {"type": "continuous_quantile", "groups": quantile_groups}
             annotated_records.extend(quantile_groups)
 
-        rules = build_threshold_rules(records, field, args.min_group_count)
+        if should_build_rules:
+            rules = build_threshold_rules(records, field, args.min_group_count, args.max_rule_candidates)
+        else:
+            rules = []
         if rules:
             best_rule = rules[0]
             gated = apply_gate(
