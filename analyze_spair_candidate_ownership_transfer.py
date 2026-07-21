@@ -114,8 +114,8 @@ def summarize(records: list[dict[str, Any]]) -> dict[str, Any]:
             np.mean([int(record["candidate_overlaps_other_gt_pck"]) for record in records])
         ),
         "mean_owner_score_rank": float(np.mean([float(record["owner_score_rank_at_candidate"]) for record in records])),
-        "mean_owner_minus_best_other_score": float(
-            np.mean([float(record["owner_minus_best_other_score"]) for record in records])
+        "mean_owner_minus_best_other_score": safe_mean(
+            [record.get("owner_minus_best_other_score") for record in records]
         ),
         "mean_owner_to_primary_origin_src_dist": safe_mean(
             [record.get("owner_to_primary_origin_src_norm_dist") for record in records]
@@ -162,8 +162,8 @@ def aggregate_ownership_pairs(records: list[dict[str, Any]]) -> list[dict[str, A
                 "mean_owner_score_rank": float(
                     np.mean([float(record["owner_score_rank_at_candidate"]) for record in subset])
                 ),
-                "mean_owner_minus_best_other_score": float(
-                    np.mean([float(record["owner_minus_best_other_score"]) for record in subset])
+                "mean_owner_minus_best_other_score": safe_mean(
+                    [record.get("owner_minus_best_other_score") for record in subset]
                 ),
                 "mean_src_norm_dist": safe_mean(
                     [record.get("owner_to_primary_origin_src_norm_dist") for record in subset]
@@ -290,7 +290,7 @@ def main():
                 owner_rank_in_own_candidates = None if not owner_origins else int(owner_origins[0]["candidate_rank"])
                 candidate_scores = union_scores[:, candidate_column]
                 best_other_scores = np.delete(candidate_scores, owner_idx)
-                best_other_score = float(np.max(best_other_scores)) if len(best_other_scores) else float("-inf")
+                best_other_score = float(np.max(best_other_scores)) if len(best_other_scores) else None
                 dominant_source_idx = int(np.argmax(candidate_scores))
                 owner_score = float(candidate_scores[owner_idx])
                 gt_distances = np.asarray(
@@ -336,8 +336,12 @@ def main():
                     "owner_is_dominant_source": int(dominant_source_idx == owner_idx),
                     "owner_score_at_candidate": owner_score,
                     "best_other_score_at_candidate": best_other_score,
-                    "owner_minus_best_other_score": float(owner_score - best_other_score),
-                    "owner_score_below_best_other": int(owner_score < best_other_score),
+                    "owner_minus_best_other_score": (
+                        None if best_other_score is None else float(owner_score - best_other_score)
+                    ),
+                    "owner_score_below_best_other": int(
+                        best_other_score is not None and owner_score < best_other_score
+                    ),
                     "owner_score_rank_at_candidate": score_rank(candidate_scores, owner_idx),
                     "num_gt_within_candidate_pck": int(len(within_pck)),
                     "candidate_overlaps_other_gt_pck": int(len(other_within_pck) > 0),
@@ -398,6 +402,15 @@ def main():
 
     ownership_pairs = aggregate_ownership_pairs(records)
     supported_pairs = [record for record in ownership_pairs if int(record["count"]) >= args.min_pair_support]
+    non_overlap_records = [
+        record for record in records if int(record["candidate_overlaps_other_gt_pck"]) == 0
+    ]
+    overlap_records = [
+        record for record in records if int(record["candidate_overlaps_other_gt_pck"]) == 1
+    ]
+    non_overlap_transfer_records = [
+        record for record in non_overlap_records if int(record["is_transfer"]) == 1
+    ]
     summary = {
         "candidate_topk": int(args.candidate_topk),
         "num_cohort_records": len(records),
@@ -406,6 +419,11 @@ def main():
         "overall": summarize(records),
         "transfer_only": summarize([record for record in records if int(record["is_transfer"]) == 1]),
         "owner_proposed": summarize([record for record in records if int(record["is_transfer"]) == 0]),
+        "non_overlap": summarize(non_overlap_records),
+        "overlap": summarize(overlap_records),
+        "non_overlap_transfer": summarize(non_overlap_transfer_records),
+        "non_overlap_recovery_coverage_of_raw_failures": len(non_overlap_records) / max(total_raw_failures, 1),
+        "non_overlap_transfer_coverage_of_raw_failures": len(non_overlap_transfer_records) / max(total_raw_failures, 1),
         "num_ownership_pairs": len(ownership_pairs),
         "min_pair_support": int(args.min_pair_support),
         "top_ownership_pairs": ownership_pairs[:50],
