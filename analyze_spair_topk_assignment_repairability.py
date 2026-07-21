@@ -53,6 +53,12 @@ def parse_args():
         help="Target-coordinate collision radius as a fraction of target bbox scale.",
     )
     parser.add_argument(
+        "--assignment_fallback_penalty",
+        type=float,
+        default=0.05,
+        help="Score penalty for the private unmatched/fallback slot in raw global assignment.",
+    )
+    parser.add_argument(
         "--repair_fractions",
         nargs="+",
         type=float,
@@ -129,6 +135,26 @@ def sample_keypoint_vectors(
 ) -> torch.Tensor:
     vectors = [sample_feature_at_pixel(feature, int(point[0]), int(point[1]), eval_h, eval_w) for point in points]
     return F.normalize(torch.stack(vectors, dim=0).float(), dim=1)
+
+
+def sample_flat_index_vectors(
+    feature: torch.Tensor,
+    flat_indices: np.ndarray,
+    eval_h: int,
+    eval_w: int,
+) -> torch.Tensor:
+    """Batch-sample high-resolution pixel locations from a low-resolution feature map."""
+    if len(flat_indices) == 0:
+        return torch.empty((0, feature.shape[1]), dtype=torch.float32, device=feature.device)
+    indices = torch.as_tensor(flat_indices, dtype=torch.long, device=feature.device)
+    x = (indices % int(eval_w)).float()
+    y = torch.div(indices, int(eval_w), rounding_mode="floor").float()
+    grid_x = 2.0 * ((x + 0.5) / float(eval_w)) - 1.0
+    grid_y = 2.0 * ((y + 0.5) / float(eval_h)) - 1.0
+    grid = torch.stack((grid_x, grid_y), dim=1).view(1, -1, 1, 2)
+    sampled = F.grid_sample(feature, grid, mode="bilinear", align_corners=False)
+    vectors = sampled[0, :, :, 0].transpose(0, 1).contiguous().float()
+    return F.normalize(vectors, dim=1)
 
 
 def topk_score_maps(
@@ -215,7 +241,7 @@ def build_candidate_union(top_indices: np.ndarray, top_values: np.ndarray, width
     return np.asarray(union, dtype=np.int64), allowed_scores
 
 
-def solve_raw_score_assignment(
+def solve_own_candidate_score_assignment(
     top_indices: np.ndarray,
     top_values: np.ndarray,
     gt_points: list[list[int]],
@@ -260,17 +286,69 @@ def solve_raw_score_assignment(
     }
 
 
+def solve_global_score_assignment(
+    union_indices: np.ndarray,
+    union_scores: np.ndarray,
+    top1_indices: np.ndarray,
+    top1_values: np.ndarray,
+    gt_points: list[list[int]],
+    target_width: int,
+    target_threshold: float,
+    fallback_penalty: float,
+) -> dict[str, Any]:
+    """Assign any candidate in the global union using only raw feature scores."""
+    num_points, num_candidates = union_scores.shape
+    augmented = np.full((num_points, num_candidates + num_points), -1e6, dtype=np.float64)
+    augmented[:, :num_candidates] = union_scores.astype(np.float64)
+    for point_idx in range(num_points):
+        augmented[point_idx, num_candidates + point_idx] = (
+            float(top1_values[point_idx]) - float(fallback_penalty)
+        )
+    rows, columns = linear_sum_assignment(-augmented)
+    chosen_indices = np.asarray(top1_indices, dtype=np.int64).copy()
+    chosen_scores = np.asarray(top1_values, dtype=np.float64).copy() - float(fallback_penalty)
+    used_fallback = np.ones(num_points, dtype=np.int64)
+    for row, column in zip(rows.tolist(), columns.tolist()):
+        if column < num_candidates:
+            chosen_indices[row] = int(union_indices[column])
+            chosen_scores[row] = float(union_scores[row, column])
+            used_fallback[row] = 0
+
+    chosen_xy = target_coordinates(chosen_indices, target_width)
+    correct = np.asarray(
+        [point_is_correct(x, y, gt_points[idx], target_threshold) for idx, (x, y) in enumerate(chosen_xy)],
+        dtype=np.int64,
+    )
+    return {
+        "chosen_indices": chosen_indices,
+        "chosen_scores": chosen_scores,
+        "correct": correct,
+        "changed": (chosen_indices != np.asarray(top1_indices)).astype(np.int64),
+        "used_fallback": used_fallback,
+    }
+
+
 def solve_assignment_oracle(
     top_indices: np.ndarray,
     gt_points: list[list[int]],
     target_width: int,
     target_threshold: float,
+    restrict_to_own_candidates: bool,
 ) -> dict[str, Any]:
-    """Maximum number of PCK-correct assignments inside the candidate union."""
+    """Maximum PCK-correct assignment inside either own sets or their global union."""
     num_points, _ = top_indices.shape
     union = sorted({int(index) for index in top_indices.reshape(-1).tolist() if int(index) >= 0})
     union = np.asarray(union, dtype=np.int64)
     num_candidates = len(union)
+    union_lookup = {int(index): column for column, index in enumerate(union.tolist())}
+    allowed = np.zeros((num_points, num_candidates), dtype=bool)
+    if restrict_to_own_candidates:
+        for point_idx in range(num_points):
+            for index in top_indices[point_idx].tolist():
+                if int(index) >= 0:
+                    allowed[point_idx, union_lookup[int(index)]] = True
+    else:
+        allowed[:, :] = True
     candidate_xy = target_coordinates(union, target_width)
     valid = np.zeros((num_points, num_candidates), dtype=np.float64)
     for point_idx, gt in enumerate(gt_points):
@@ -278,12 +356,12 @@ def solve_assignment_oracle(
         valid[point_idx] = (np.sum(delta * delta, axis=1) <= float((0.1 * target_threshold) ** 2)).astype(np.float64)
 
     augmented = np.zeros((num_points, num_candidates + num_points), dtype=np.float64)
-    augmented[:, :num_candidates] = np.where(valid > 0, 1.0, -1e6)
+    augmented[:, :num_candidates] = np.where((valid > 0) & allowed, 1.0, -1e6)
     rows, columns = linear_sum_assignment(-augmented)
     matched = np.zeros(num_points, dtype=np.int64)
     chosen_indices = np.full(num_points, -1, dtype=np.int64)
     for row, column in zip(rows.tolist(), columns.tolist()):
-        if column < num_candidates and valid[row, column] > 0:
+        if column < num_candidates and valid[row, column] > 0 and allowed[row, column]:
             matched[row] = 1
             chosen_indices[row] = union[column]
     return {
@@ -381,14 +459,22 @@ def summarize_records(records: list[dict[str, Any]], topks: list[int]) -> dict[s
         "raw_pck": safe_rate([int(record["raw_correct"]) for record in records]),
         "raw_error_rate": safe_rate([1 - int(record["raw_correct"]) for record in records]),
         "candidate_oracle_pck": {},
-        "assignment_oracle_pck": {},
-        "raw_score_assignment_pck": {},
+        "own_candidate_assignment_oracle_pck": {},
+        "global_union_assignment_oracle_pck": {},
+        "global_union_raw_score_assignment_pck": {},
     }
     for topk in topks:
         key = str(topk)
         summary["candidate_oracle_pck"][key] = safe_rate([int(record[f"candidate_hit@{topk}"]) for record in records])
-        summary["assignment_oracle_pck"][key] = safe_rate([int(record[f"assignment_oracle_hit@{topk}"]) for record in records])
-        summary["raw_score_assignment_pck"][key] = safe_rate([int(record[f"assignment_correct@{topk}"]) for record in records])
+        summary["own_candidate_assignment_oracle_pck"][key] = safe_rate(
+            [int(record[f"own_assignment_oracle_hit@{topk}"]) for record in records]
+        )
+        summary["global_union_assignment_oracle_pck"][key] = safe_rate(
+            [int(record[f"global_union_assignment_oracle_hit@{topk}"]) for record in records]
+        )
+        summary["global_union_raw_score_assignment_pck"][key] = safe_rate(
+            [int(record[f"global_assignment_correct@{topk}"]) for record in records]
+        )
     return summary
 
 
@@ -471,12 +557,30 @@ def main():
                 trg_eval_w,
             )
             top1_cross_scores = (top1_target_vectors @ src_vectors.transpose(0, 1)).detach().cpu().numpy()
-            raw_assignment = solve_raw_score_assignment(
-                top_indices,
-                top_values,
+            max_union_indices = np.asarray(
+                sorted({int(index) for index in top_indices.reshape(-1).tolist() if int(index) >= 0}),
+                dtype=np.int64,
+            )
+            max_union_vectors = sample_flat_index_vectors(
+                trg_feature,
+                max_union_indices,
+                trg_eval_h,
+                trg_eval_w,
+            )
+            max_union_scores = (
+                src_vectors @ max_union_vectors.transpose(0, 1)
+            ).detach().cpu().numpy()
+            max_union_lookup = {int(index): column for column, index in enumerate(max_union_indices.tolist())}
+            max_top1_scores = top_values[:, 0]
+            raw_assignment = solve_global_score_assignment(
+                max_union_indices,
+                max_union_scores,
+                top_indices[:, 0],
+                max_top1_scores,
                 data["trg_kps"],
                 trg_eval_w,
                 target_threshold,
+                args.assignment_fallback_penalty,
             )
             risks = compute_risk_features(
                 top_indices,
@@ -534,24 +638,43 @@ def main():
 
             for topk in topks:
                 selected_indices = top_indices[:, :topk]
-                assignment_oracle = solve_assignment_oracle(
+                own_assignment_oracle = solve_assignment_oracle(
                     selected_indices,
                     data["trg_kps"],
                     trg_eval_w,
                     target_threshold,
+                    restrict_to_own_candidates=True,
                 )
-                assignment_oracle_matched = assignment_oracle["matched"]
-                score_assignment = solve_raw_score_assignment(
+                global_assignment_oracle = solve_assignment_oracle(
                     selected_indices,
-                    top_values[:, :topk],
                     data["trg_kps"],
                     trg_eval_w,
                     target_threshold,
+                    restrict_to_own_candidates=False,
+                )
+                selected_union_indices = np.asarray(
+                    sorted({int(index) for index in selected_indices.reshape(-1).tolist() if int(index) >= 0}),
+                    dtype=np.int64,
+                )
+                selected_union_columns = np.asarray(
+                    [max_union_lookup[int(index)] for index in selected_union_indices.tolist()],
+                    dtype=np.int64,
+                )
+                score_assignment = solve_global_score_assignment(
+                    selected_union_indices,
+                    max_union_scores[:, selected_union_columns],
+                    selected_indices[:, 0],
+                    top_values[:, 0],
+                    data["trg_kps"],
+                    trg_eval_w,
+                    target_threshold,
+                    args.assignment_fallback_penalty,
                 )
                 for point_idx, record in enumerate(pair_records):
-                    record[f"assignment_oracle_hit@{topk}"] = int(assignment_oracle_matched[point_idx])
-                    record[f"assignment_correct@{topk}"] = int(score_assignment["correct"][point_idx])
-                    record[f"assignment_changed@{topk}"] = int(score_assignment["changed"][point_idx])
+                    record[f"own_assignment_oracle_hit@{topk}"] = int(own_assignment_oracle["matched"][point_idx])
+                    record[f"global_union_assignment_oracle_hit@{topk}"] = int(global_assignment_oracle["matched"][point_idx])
+                    record[f"global_assignment_correct@{topk}"] = int(score_assignment["correct"][point_idx])
+                    record[f"global_assignment_changed@{topk}"] = int(score_assignment["changed"][point_idx])
                     record[f"assignment_pred_x@{topk}"] = int(
                         target_coordinates(score_assignment["chosen_indices"], trg_eval_w)[point_idx, 0]
                     )
@@ -586,13 +709,22 @@ def main():
     for signal, direction in signal_specs.items():
         repairability[signal] = {}
         for topk in topks:
-            repairability[signal][str(topk)] = risk_curve(
-                all_records,
-                signal,
-                direction,
-                f"candidate_hit@{topk}",
-                args.repair_fractions,
-            )
+            repairability[signal][str(topk)] = {
+                "own_candidate_repairability": risk_curve(
+                    all_records,
+                    signal,
+                    direction,
+                    f"candidate_hit@{topk}",
+                    args.repair_fractions,
+                ),
+                "global_union_assignment_repairability": risk_curve(
+                    all_records,
+                    signal,
+                    direction,
+                    f"global_union_assignment_oracle_hit@{topk}",
+                    args.repair_fractions,
+                ),
+            }
 
     summary = {
         "num_records": len(all_records),
@@ -601,6 +733,7 @@ def main():
         "cd": bool(args.cd),
         "device": str(device),
         "collision_radius_norm": float(args.collision_radius_norm),
+        "assignment_fallback_penalty": float(args.assignment_fallback_penalty),
         "overall": summarize_records(all_records, topks),
         "failure_subset": summarize_records(
             [record for record in all_records if int(record["raw_correct"]) == 0], topks
@@ -609,9 +742,10 @@ def main():
         "repairability": repairability,
         "interpretation": {
             "candidate_hit": "GT lies within the PCK radius of at least one raw top-K candidate; this is a candidate-recall ceiling, not an online method.",
-            "assignment_oracle_hit": "Maximum PCK-correct matches under distinct candidate slots, using GT only to evaluate the ceiling.",
-            "assignment_correct": "Non-oracle raw-score assignment over the candidate union; it is an actual simple structured baseline.",
-            "repairability": "Risk curves rank points only by label-free score-map signals, then use GT after ranking to measure how many candidate-repairable errors could be gated.",
+            "own_assignment_oracle_hit": "Maximum PCK-correct assignment when each source point may use only its own top-K candidates.",
+            "global_union_assignment_oracle_hit": "Maximum PCK-correct assignment when all source points share the union of top-K candidates; this is a broader candidate-pool ceiling and may exceed per-point recall.",
+            "global_assignment_correct": "Non-oracle raw-feature score assignment over the shared candidate union, with a private fallback penalty.",
+            "repairability": "Risk curves rank points only by label-free score-map signals, then use GT after ranking to measure own-candidate and global-union repairable errors.",
             "limitations": "Candidate and assignment ceilings do not repair GT absent from the candidate set or identity information already lost in raw features.",
         },
     }
