@@ -401,7 +401,14 @@ def save_records(path: str, records: list[dict[str, Any]]):
         writer.writerows(records)
 
 
-def main(args):
+def main(
+    args,
+    ownership_fn=None,
+    method_tag: str | None = None,
+    method_name: str = "relational_candidate_ownership",
+):
+    if ownership_fn is None:
+        ownership_fn = relational_candidate_ownership
     for name, value in vars(args).items():
         if value is not None:
             print(f"{name}: {value}")
@@ -422,6 +429,14 @@ def main(args):
     total_improvements = 0
     total_harms = 0
     total_changed = 0
+    method_diagnostic_fields = (
+        "transform_valid",
+        "transform_inlier_ratio",
+        "transform_median_residual",
+        "transform_quality",
+    )
+    method_diagnostic_sums = {field: 0.0 for field in method_diagnostic_fields}
+    method_diagnostic_counts = {field: 0 for field in method_diagnostic_fields}
     baseline_image_pck: list[float] = []
     method_image_pck: list[float] = []
     mean_baseline_image_sum = 0.0
@@ -487,7 +502,7 @@ def main(args):
                     args.rco_base_reverse_weight,
                 )
             candidate_records = normalize_candidate_records(candidate_records)
-            predictions, baseline_predictions, diagnostics, bundle = relational_candidate_ownership(
+            predictions, baseline_predictions, diagnostics, bundle = ownership_fn(
                 candidate_records,
                 src_ft,
                 trg_ft,
@@ -524,6 +539,11 @@ def main(args):
                 total_improvements += improvement
                 total_harms += harm
                 total_changed += int(diag["changed"])
+                for field in method_diagnostic_fields:
+                    value = diag.get(field)
+                    if value is not None and np.isfinite(float(value)):
+                        method_diagnostic_sums[field] += float(value)
+                        method_diagnostic_counts[field] += 1
 
                 raw_gt_index, raw_gt_rank, raw_gt_score = best_valid_union_candidate(
                     bundle["union_xy"],
@@ -592,7 +612,7 @@ def main(args):
                             "occlusion": data.get("occlusion"),
                             "truncation": data.get("truncation"),
                             **diag,
-                            "method_tag": "relational_candidate_ownership",
+                            "method_tag": method_name,
                         }
                     )
 
@@ -637,6 +657,13 @@ def main(args):
             "net_gain": (total_improvements - total_harms) / max(total_points, 1),
         },
     )
+    method_diagnostic_means = {
+        field: method_diagnostic_sums[field] / method_diagnostic_counts[field]
+        for field in method_diagnostic_fields
+        if method_diagnostic_counts[field] > 0
+    }
+    if method_diagnostic_means:
+        print("Method diagnostics:", method_diagnostic_means)
 
     result["summary"] = {
         "baseline_all_image": baseline_all_image * 100,
@@ -653,13 +680,16 @@ def main(args):
         "mean_baseline_point": mean_baseline_point_sum / max(len(all_cats), 1),
         "mean_method_point": mean_method_point_sum / max(len(all_cats), 1),
     }
+    if method_diagnostic_means:
+        result["summary"]["method_diagnostics"] = method_diagnostic_means
 
     output_dir = args.point_records_dir if args.point_records_dir else os.path.join("layers_cat", args.dit_model)
     os.makedirs(output_dir, exist_ok=True)
-    method_tag = (
-        f"rco_topk{args.rco_topk}_aq{args.rco_anchor_quantile}_rw{args.rco_relation_weight}"
-        f"_ow{args.rco_owner_margin_weight}_sg{args.rco_min_structural_gain}"
-    )
+    if method_tag is None:
+        method_tag = (
+            f"rco_topk{args.rco_topk}_aq{args.rco_anchor_quantile}_rw{args.rco_relation_weight}"
+            f"_ow{args.rco_owner_margin_weight}_sg{args.rco_min_structural_gain}"
+        )
     result_path = os.path.join(output_dir, f"t{args.t}_b{args.k}_e{args.ensemble_size}_{method_tag}.json")
     with open(result_path, "w", encoding="utf-8") as handle:
         json.dump(result, handle, indent=2, ensure_ascii=False)
@@ -670,8 +700,10 @@ def main(args):
         print(f"Saved point records to: {records_path}")
 
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="SPair relational candidate ownership evaluator")
+def build_argument_parser(
+    description: str = "SPair relational candidate ownership evaluator",
+) -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=description)
     parser.add_argument("--dataset_path", type=str, default="/dataset/SPair-71k")
     parser.add_argument("--dataset", type=str, default="spair")
     parser.add_argument("--save_path", type=str, default="/scratch/lt453/spair_ft/")
@@ -714,7 +746,11 @@ if __name__ == "__main__":
     parser.add_argument("--rco_modify_anchors", action="store_true", default=False)
     parser.add_argument("--save_point_records", action="store_true", default=False)
     parser.add_argument("--point_records_dir", type=str, default="")
-    args = parser.parse_args()
+    return parser
+
+
+if __name__ == "__main__":
+    args = build_argument_parser().parse_args()
     torch.backends.cudnn.enabled = True
     torch.backends.cudnn.benchmark = True
     main(args)
