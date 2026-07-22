@@ -440,6 +440,9 @@ def main(
         "transform_inlier_ratio",
         "transform_median_residual",
         "transform_quality",
+        "joint_energy_gain",
+        "joint_bp_energy_gain",
+        "joint_structural_edge_count",
     )
     method_diagnostic_sums = {field: 0.0 for field in method_diagnostic_fields}
     method_diagnostic_counts = {field: 0 for field in method_diagnostic_fields}
@@ -600,7 +603,7 @@ def main(
                             "method_pred_x": int(method_xy[0]),
                             "method_pred_y": int(method_xy[1]),
                             "baseline_norm_dist": baseline_dist / max(float(trg_threshold), 1e-6),
-                "method_norm_dist": method_dist / max(float(trg_threshold), 1e-6),
+                            "method_norm_dist": method_dist / max(float(trg_threshold), 1e-6),
                             "proposed_pred_x": diag.get("proposed_pred_x"),
                             "proposed_pred_y": diag.get("proposed_pred_y"),
                             "proposal_norm_dist": (
