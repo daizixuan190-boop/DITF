@@ -452,6 +452,8 @@ def geometry_aware_relational_ownership(
                 "structural_gain": structural_gain,
                 "base_final_score": float(final_scores[point_idx, base_column].item()),
                 "proposed_final_score": float(final_scores[point_idx, proposed_column].item()),
+                "proposed_pred_x": int(bundle["union_x"][proposed_column].item()),
+                "proposed_pred_y": int(bundle["union_y"][proposed_column].item()),
                 "base_column": base_column,
                 "proposed_column": proposed_column,
                 "final_column": final_column,

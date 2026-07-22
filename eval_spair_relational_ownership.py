@@ -326,6 +326,10 @@ def relational_candidate_ownership(
             int(bundle["union_x"][final_column].item()),
             int(bundle["union_y"][final_column].item()),
         )
+        proposed_xy = (
+            int(bundle["union_x"][proposed_column].item()),
+            int(bundle["union_y"][proposed_column].item()),
+        )
         baseline_predictions.append(base_xy)
         predictions.append(final_xy)
         diagnostics.append(
@@ -351,6 +355,8 @@ def relational_candidate_ownership(
                 "structural_gain": structural_gain,
                 "base_final_score": float(final_scores[point_idx, base_column].item()),
                 "proposed_final_score": float(final_scores[point_idx, proposed_column].item()),
+                "proposed_pred_x": proposed_xy[0],
+                "proposed_pred_y": proposed_xy[1],
                 "base_column": base_column,
                 "proposed_column": proposed_column,
                 "final_column": final_column,
@@ -594,7 +600,39 @@ def main(
                             "method_pred_x": int(method_xy[0]),
                             "method_pred_y": int(method_xy[1]),
                             "baseline_norm_dist": baseline_dist / max(float(trg_threshold), 1e-6),
-                            "method_norm_dist": method_dist / max(float(trg_threshold), 1e-6),
+                "method_norm_dist": method_dist / max(float(trg_threshold), 1e-6),
+                            "proposed_pred_x": diag.get("proposed_pred_x"),
+                            "proposed_pred_y": diag.get("proposed_pred_y"),
+                            "proposal_norm_dist": (
+                                float(
+                                    np.hypot(
+                                        float(diag["proposed_pred_x"]) - gt_point[0],
+                                        float(diag["proposed_pred_y"]) - gt_point[1],
+                                    )
+                                    / max(float(trg_threshold), 1e-6)
+                                )
+                                if diag.get("proposed_pred_x") is not None
+                                and diag.get("proposed_pred_y") is not None
+                                else None
+                            ),
+                            "proposal_correct": (
+                                int(
+                                    float(
+                                        np.hypot(
+                                            float(diag["proposed_pred_x"]) - gt_point[0],
+                                            float(diag["proposed_pred_y"]) - gt_point[1],
+                                        )
+                                        / max(float(trg_threshold), 1e-6)
+                                    )
+                                    <= 0.1
+                                )
+                                if diag.get("proposed_pred_x") is not None
+                                and diag.get("proposed_pred_y") is not None
+                                else None
+                            ),
+                            "gate_blocked": int(
+                                diag.get("proposed_column") != diag.get("final_column")
+                            ),
                             "baseline_correct": baseline_correct,
                             "method_correct": method_correct,
                             "improvement": improvement,
