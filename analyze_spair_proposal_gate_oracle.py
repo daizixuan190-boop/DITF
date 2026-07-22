@@ -101,6 +101,11 @@ def summarize(rows: list[dict[str, str]]) -> dict[str, Any]:
         for row in rows
         if parse_float(row, "proposal_norm_dist") is not None
     ]
+    oracle_gate_correct = [
+        max(parse_int(row, "baseline_correct"), parse_int(row, "proposal_correct"))
+        for row in rows
+        if parse_float(row, "proposal_norm_dist") is not None
+    ]
     gate_missed_recovery = [
         int(
             parse_int(row, "baseline_correct") == 0
@@ -166,6 +171,27 @@ def summarize(rows: list[dict[str, str]]) -> dict[str, Any]:
         ),
         "proposal_improvement_rate": sum(proposal_improvements) / count if count else 0.0,
         "proposal_harm_rate": sum(proposal_harms) / count if count else 0.0,
+        "perfect_gate_pck_upper_bound": (
+            sum(oracle_gate_correct) / count if oracle_gate_correct else None
+        ),
+        "perfect_gate_delta_vs_baseline": (
+            sum(oracle_gate_correct) / count - mean(baseline_correct)
+            if oracle_gate_correct and count
+            else None
+        ),
+        "proposal_recovery_rate_upper_bound": (
+            sum(proposal_improvements) / count if proposal_available else None
+        ),
+        "accepted_recovery_efficiency": (
+            sum(gate_accepted_recovery) / sum(proposal_improvements)
+            if proposal_improvements and sum(proposal_improvements)
+            else None
+        ),
+        "proposal_harm_filter_rate": (
+            sum(gate_avoided_harm) / sum(proposal_harms)
+            if proposal_harms and sum(proposal_harms)
+            else None
+        ),
         "proposal_changed_rate": sum(proposal_changed) / count if count else 0.0,
         "gate_blocked_rate": sum(gate_blocked) / count if count else 0.0,
         "gate_missed_recovery_rate": sum(gate_missed_recovery) / count if count else 0.0,
