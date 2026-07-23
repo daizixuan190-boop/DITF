@@ -8,6 +8,7 @@ an 840 square zero canvas, ViT-B/14 block-11 tokens, and a 60x60 patch grid.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import math
 from typing import Iterable, Sequence
 
 import numpy as np
@@ -200,5 +201,101 @@ def summarize_candidate_rows(
             row[f"owner_candidate_hit@{requested_k}"] = int(owner)
             row[f"other_source_candidate_hit@{requested_k}"] = int(other)
             row[f"global_union_candidate_hit@{requested_k}"] = int(owner or other)
+        rows.append(row)
+    return rows
+
+
+def _random_union_hit_probability(population: int, positives: int, draws: int) -> float:
+    """Exact hit probability for uniformly sampling ``draws`` unique patches."""
+    draws = min(max(int(draws), 0), population)
+    positives = min(max(int(positives), 0), population)
+    if draws == 0 or positives == 0:
+        return 0.0
+    if draws > population - positives:
+        return 1.0
+    log_miss = (
+        math.lgamma(population - positives + 1)
+        - math.lgamma(population - positives - draws + 1)
+        - math.lgamma(population + 1)
+        + math.lgamma(population - draws + 1)
+    )
+    return min(max(1.0 - math.exp(log_miss), 0.0), 1.0)
+
+
+def controlled_candidate_rows(
+    scores: torch.Tensor,
+    gt_points: torch.Tensor,
+    threshold: float,
+    width: int,
+    ks: Iterable[int],
+    patch_stride: float,
+) -> list[dict[str, int | float]]:
+    """Compute ownership diagnostics with overlap, budget and random controls.
+
+    Ground truth is used only to label candidate coverage after ranking. It
+    never changes ``scores``, candidate proposals or baseline predictions.
+    """
+    if scores.ndim != 2 or scores.shape[0] != gt_points.shape[0]:
+        raise ValueError("scores and gt_points must describe the same source points")
+    if scores.shape[1] % width:
+        raise ValueError("target patch count must be divisible by width")
+    ks = tuple(sorted(set(int(k) for k in ks)))
+    if not ks or min(ks) < 1:
+        raise ValueError("candidate K values must be positive")
+
+    num_sources, population = scores.shape
+    max_rank = min(max(ks) * num_sources, population)
+    ranked = scores.topk(max_rank, dim=1).indices
+    all_indices = torch.arange(population, device=scores.device)
+    all_points = patch_indices_to_points(all_indices, width, patch_stride)
+    gt_points = gt_points.to(device=scores.device, dtype=torch.float32)
+    radius = 0.1 * float(threshold)
+    patch_hits_all_gt = torch.cdist(all_points, gt_points) < radius
+    rows: list[dict[str, int | float]] = []
+
+    for owner_index, gt_xy in enumerate(gt_points):
+        row: dict[str, int | float] = {"point_index": owner_index}
+        patch_hits_owner = patch_hits_all_gt[:, owner_index]
+        positive_count = int(patch_hits_owner.sum())
+        other_gt_columns = torch.arange(num_sources, device=scores.device) != owner_index
+
+        for requested_k in ks:
+            k = min(requested_k, ranked.shape[1])
+            local = ranked[:, :k]
+            owner_candidates = local[owner_index]
+            owner_hit = bool(patch_hits_owner[owner_candidates].any())
+            other_rows = torch.cat((local[:owner_index], local[owner_index + 1 :]), dim=0)
+            other_candidates = other_rows.reshape(-1)
+            other_hit_mask = patch_hits_owner[other_candidates] if other_candidates.numel() else torch.zeros(
+                0, dtype=torch.bool, device=scores.device
+            )
+            other_hit = bool(other_hit_mask.any())
+            strict_other_hit = bool(
+                other_candidates.numel()
+                and (other_hit_mask & ~patch_hits_all_gt[other_candidates][:, other_gt_columns].any(dim=1)).any()
+            )
+            global_hit = owner_hit or other_hit
+            strict_global_hit = owner_hit or strict_other_hit
+
+            global_unique = torch.unique(local)
+            unique_budget = int(global_unique.numel())
+            budget_owner = ranked[owner_index, :unique_budget]
+            budget_owner_hit = bool(patch_hits_owner[budget_owner].any())
+            source_support = int(patch_hits_owner[local].any(dim=1).sum())
+            random_expected = _random_union_hit_probability(population, positive_count, unique_budget)
+
+            row[f"owner_candidate_hit@{requested_k}"] = int(owner_hit)
+            row[f"other_source_candidate_hit@{requested_k}"] = int(other_hit)
+            row[f"global_union_candidate_hit@{requested_k}"] = int(global_hit)
+            row[f"strict_other_source_candidate_hit@{requested_k}"] = int(strict_other_hit)
+            row[f"strict_global_union_candidate_hit@{requested_k}"] = int(strict_global_hit)
+            row[f"budget_matched_owner_candidate_hit@{requested_k}"] = int(budget_owner_hit)
+            row[f"global_not_budget_owner_hit@{requested_k}"] = int(global_hit and not budget_owner_hit)
+            row[f"strict_global_not_budget_owner_hit@{requested_k}"] = int(
+                strict_global_hit and not budget_owner_hit
+            )
+            row[f"global_unique_candidate_count@{requested_k}"] = unique_budget
+            row[f"proposal_source_count@{requested_k}"] = source_support
+            row[f"random_union_expected_hit@{requested_k}"] = random_expected
         rows.append(row)
     return rows

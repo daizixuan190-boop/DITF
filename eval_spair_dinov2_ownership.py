@@ -23,17 +23,17 @@ from dino_v2_spair import (
     PAPER_DINO_ALL_POINT,
     CategoryMetrics,
     DINOConfig,
+    controlled_candidate_rows,
     cosine_similarity_scores,
     patch_indices_to_points,
     pck_hits,
     square_canvas_geometry,
-    summarize_candidate_rows,
     transform_points_to_canvas,
 )
 from eval_spair_dinov2 import Extractor, build_extractor, category_image_names, discover_pairs
 
 
-def empty_counts(ks: tuple[int, ...]) -> dict[int, dict[str, int]]:
+def empty_counts(ks: tuple[int, ...]) -> dict[int, dict[str, int | float]]:
     return {
         k: defaultdict(int)
         for k in ks
@@ -41,8 +41,8 @@ def empty_counts(ks: tuple[int, ...]) -> dict[int, dict[str, int]]:
 
 
 def update_counts(
-    counts: dict[int, dict[str, int]],
-    rows: list[dict[str, int]],
+    counts: dict[int, dict[str, int | float]],
+    rows: list[dict[str, int | float]],
     baseline_hits: torch.Tensor,
     ks: tuple[int, ...],
 ) -> None:
@@ -52,23 +52,51 @@ def update_counts(
             owner = row[f"owner_candidate_hit@{k}"]
             other = row[f"other_source_candidate_hit@{k}"]
             union = row[f"global_union_candidate_hit@{k}"]
+            strict_other = row[f"strict_other_source_candidate_hit@{k}"]
+            strict_union = row[f"strict_global_union_candidate_hit@{k}"]
+            budget_owner = row[f"budget_matched_owner_candidate_hit@{k}"]
+            global_not_budget = row[f"global_not_budget_owner_hit@{k}"]
+            strict_global_not_budget = row[f"strict_global_not_budget_owner_hit@{k}"]
+            source_count = row[f"proposal_source_count@{k}"]
             values["points"] += 1
             values["owner"] += owner
             values["other"] += other
             values["global"] += union
+            values["strict_other"] += strict_other
+            values["strict_global"] += strict_union
+            values["budget_owner"] += budget_owner
+            values["global_not_budget"] += global_not_budget
+            values["strict_global_not_budget"] += strict_global_not_budget
+            values["unique_candidates"] += row[f"global_unique_candidate_count@{k}"]
+            values["random_expected"] += row[f"random_union_expected_hit@{k}"]
+            if union:
+                values["global_hits"] += 1
+                values["source_support_on_global"] += source_count
+                values["multi_source_global"] += int(source_count >= 2)
             if not baseline_hit:
                 values["failures"] += 1
                 values["failure_owner"] += owner
                 values["failure_global"] += union
                 values["failure_transferable"] += int(union and not owner)
+                values["failure_strict_transferable"] += int(strict_other and not owner)
+                values["failure_budget_owner"] += budget_owner
+                values["failure_global_not_budget"] += global_not_budget
+                values["failure_strict_global_not_budget"] += strict_global_not_budget
+                values["failure_random_expected"] += row[f"random_union_expected_hit@{k}"]
+                if union:
+                    values["failure_global_hits"] += 1
+                    values["failure_source_support_on_global"] += source_count
+                    values["failure_multi_source_global"] += int(source_count >= 2)
 
 
-def ratios(counts: dict[int, dict[str, int]], ks: tuple[int, ...]) -> dict[str, dict[str, float | int]]:
+def ratios(counts: dict[int, dict[str, int | float]], ks: tuple[int, ...]) -> dict[str, dict[str, float | int]]:
     output: dict[str, dict[str, float | int]] = {}
     for k in ks:
         values = counts[k]
         points = max(values["points"], 1)
         failures = max(values["failures"], 1)
+        global_hits = max(values["global_hits"], 1)
+        failure_global_hits = max(values["failure_global_hits"], 1)
         output[str(k)] = {
             "point_count": values["points"],
             "baseline_failure_count": values["failures"],
@@ -76,9 +104,36 @@ def ratios(counts: dict[int, dict[str, int]], ks: tuple[int, ...]) -> dict[str, 
             "other_source_transfer": values["other"] / points,
             "global_union_recall": values["global"] / points,
             "global_minus_owner": (values["global"] - values["owner"]) / points,
+            "strict_other_source_recall": values["strict_other"] / points,
+            "strict_global_union_recall": values["strict_global"] / points,
+            "budget_matched_owner_recall": values["budget_owner"] / points,
+            "global_minus_budget_matched_owner": (values["global"] - values["budget_owner"]) / points,
+            "global_not_budget_matched_owner_rate": values["global_not_budget"] / points,
+            "strict_global_not_budget_matched_owner_rate": values["strict_global_not_budget"] / points,
+            "mean_unique_global_candidates": values["unique_candidates"] / points,
+            "random_union_expected_recall": values["random_expected"] / points,
+            "global_excess_over_random": (values["global"] - values["random_expected"]) / points,
+            "mean_proposal_source_count_on_global_hits": values["source_support_on_global"] / global_hits,
+            "multi_source_rate_on_global_hits": values["multi_source_global"] / global_hits,
             "failure_owner_candidate_recall": values["failure_owner"] / failures,
             "failure_global_union_recall": values["failure_global"] / failures,
             "failure_transferable_rate": values["failure_transferable"] / failures,
+            "failure_strict_transferable_rate": values["failure_strict_transferable"] / failures,
+            "failure_budget_matched_owner_recall": values["failure_budget_owner"] / failures,
+            "failure_global_not_budget_matched_owner_rate": values["failure_global_not_budget"] / failures,
+            "failure_strict_global_not_budget_matched_owner_rate": (
+                values["failure_strict_global_not_budget"] / failures
+            ),
+            "failure_random_union_expected_recall": values["failure_random_expected"] / failures,
+            "failure_global_excess_over_random": (
+                values["failure_global"] - values["failure_random_expected"]
+            ) / failures,
+            "failure_mean_proposal_source_count_on_global_hits": (
+                values["failure_source_support_on_global"] / failure_global_hits
+            ),
+            "failure_multi_source_rate_on_global_hits": (
+                values["failure_multi_source_global"] / failure_global_hits
+            ),
         }
     return output
 
@@ -133,14 +188,13 @@ def evaluate(args: argparse.Namespace, extractor: Extractor | None = None) -> di
                 )[0]
                 hits = pck_hits(predictions, trg_points, threshold)
                 baseline[category].update(hits)
-                candidates = scores.topk(min(max(ks), scores.shape[1]), dim=1).indices
-                rows = summarize_candidate_rows(
-                    candidates,
-                    trg_points.cpu().tolist(),
+                rows = controlled_candidate_rows(
+                    scores.detach().float().cpu(),
+                    trg_points.detach().cpu(),
                     threshold,
                     60,
                     ks,
-                    patch_stride=stride,
+                    stride,
                 )
                 update_counts(total_counts, rows, hits, ks)
                 update_counts(category_counts[category], rows, hits, ks)
@@ -164,12 +218,39 @@ def evaluate(args: argparse.Namespace, extractor: Extractor | None = None) -> di
     total_points = sum(value.total for value in baseline.values())
     all_per_image = sum(all_pair_scores) / len(all_pair_scores)
     all_per_point = total_correct / total_points
+    ownership_summary = ratios(total_counts, ks)
+    validation = {
+        "owner_at_1_equals_baseline": abs(ownership_summary["1"]["owner_candidate_recall"] - all_per_point) < 1e-12
+        if 1 in ks else None,
+        "failure_owner_at_1_is_zero": ownership_summary["1"]["failure_owner_candidate_recall"] == 0.0
+        if 1 in ks else None,
+        "strict_is_bounded_by_global": all(
+            ownership_summary[str(k)]["strict_global_union_recall"]
+            <= ownership_summary[str(k)]["global_union_recall"]
+            for k in ks
+        ),
+        "budget_owner_contains_owner_topk": all(
+            ownership_summary[str(k)]["budget_matched_owner_recall"]
+            >= ownership_summary[str(k)]["owner_candidate_recall"]
+            for k in ks
+        ),
+    }
+    if any(value is False for value in validation.values()):
+        raise RuntimeError(f"Controlled ownership invariant failed: {validation}")
     summary: dict[str, Any] = {
         "protocol": {
+            "diagnostic_version": "controlled-v2",
             "baseline": "parity-verified DINOv2 ViT-B/14 block-11 token NN",
             "feature_cache": "category-scoped memory only",
             "ground_truth_changes_ranking": False,
             "interpretation": "diagnostic only; not a matching method",
+            "controls": [
+                "strict target-GT-region non-overlap",
+                "exact unique-candidate budget matched owner ranking",
+                "target-region proposal-source hubness",
+                "uniform random union expectation",
+            ],
+            "validation": validation,
         },
         "config": vars(args),
         "baseline": {
@@ -178,7 +259,7 @@ def evaluate(args: argparse.Namespace, extractor: Extractor | None = None) -> di
             "paper_all_per_image": PAPER_DINO_ALL_IMAGE,
             "paper_all_per_point": PAPER_DINO_ALL_POINT,
         },
-        "ownership": ratios(total_counts, ks),
+        "ownership": ownership_summary,
         "categories": {
             category: {
                 "baseline_per_image_pck@0.1": baseline[category].per_image,
@@ -206,7 +287,9 @@ def evaluate(args: argparse.Namespace, extractor: Extractor | None = None) -> di
         print(
             f"K={k}: owner={values['owner_candidate_recall']:.4f}, "
             f"global={values['global_union_recall']:.4f}, "
-            f"failure_transferable={values['failure_transferable_rate']:.4f}"
+            f"failure_transferable={values['failure_transferable_rate']:.4f}, "
+            f"strict={values['failure_strict_transferable_rate']:.4f}, "
+            f"budget_control={values['failure_global_not_budget_matched_owner_rate']:.4f}"
         )
     print(f"Saved ownership summary to: {output_json}")
     return summary

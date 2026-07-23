@@ -1,9 +1,12 @@
+import math
+
 import torch
 from PIL import Image
 
 from dino_v2_spair import (
     CategoryMetrics,
     candidate_hit,
+    controlled_candidate_rows,
     cosine_nn_predictions,
     pck_hits,
     preprocess_square_canvas,
@@ -48,7 +51,7 @@ def test_category_metrics_distinguishes_per_image_and_per_point():
     metrics = CategoryMetrics()
     metrics.update(torch.tensor([True]))
     metrics.update(torch.tensor([False, False, True]))
-    assert metrics.per_image == 2 / 3
+    assert math.isclose(metrics.per_image, 2 / 3, rel_tol=1e-6)
     assert metrics.per_point == 0.5
 
 
@@ -56,3 +59,34 @@ def test_candidate_hit_uses_patch_centers_in_canvas_units():
     candidates = torch.tensor([[3]])
     # Flat index 3 in a 2-wide grid is centered at (21, 21) for stride 14.
     assert candidate_hit(candidates, [21, 21], width=2, threshold=10, patch_stride=14).item()
+
+
+def test_controlled_candidates_remove_overlap_and_match_unique_budget():
+    # On a 3x3 grid, owner zero misses its GT patch 0 in top-1. Source row one
+    # proposes patch 0, while owner zero does not contain it in its top-2
+    # (the exact cardinality of the global union {0, 1}).
+    scores = torch.tensor([
+        [0.7, 1.0, 0.9, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.9],
+    ])
+    gt_points = torch.tensor([[5.0, 5.0], [25.0, 25.0]])
+    rows = controlled_candidate_rows(scores, gt_points, threshold=9, width=3, ks=[1], patch_stride=10)
+    owner = rows[0]
+    assert owner["owner_candidate_hit@1"] == 0
+    assert owner["global_union_candidate_hit@1"] == 1
+    assert owner["strict_other_source_candidate_hit@1"] == 1
+    assert owner["global_unique_candidate_count@1"] == 2
+    assert owner["budget_matched_owner_candidate_hit@1"] == 0
+    assert owner["strict_global_not_budget_owner_hit@1"] == 1
+
+
+def test_controlled_candidates_reject_other_gt_overlap():
+    scores = torch.tensor([
+        [0.0, 1.0, 0.0, 0.0],
+        [1.0, 0.0, 0.0, 0.0],
+    ])
+    # Both GT PCK regions include patch-0 center, so the donor proposal is not strict.
+    gt_points = torch.tensor([[5.0, 5.0], [6.0, 5.0]])
+    rows = controlled_candidate_rows(scores, gt_points, threshold=20, width=2, ks=[1], patch_stride=10)
+    assert rows[0]["other_source_candidate_hit@1"] == 1
+    assert rows[0]["strict_other_source_candidate_hit@1"] == 0
