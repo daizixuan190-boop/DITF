@@ -1,0 +1,1224 @@
+                                           Unleashing Diffusion Transformers for Visual
+                                         Correspondence by Modulating Massive Activations
+
+
+                                                            Chaofan Gan1,2 Yuanpeng Tu3 Xi Chen3 Tieyuan Chen1
+                                                                     Yuxi Li1 Mehrtash Harandi2 Weiyao Lin1∗
+                                                                 1
+                                                                   Shanghai Jiao Tong University 2 Monash University
+                                                                               2
+                                                                                 The University of Hong Kong
+arXiv:2505.18584v3 [cs.CV] 9 Nov 2025
+
+
+
+
+                                                             {ganchaofan, tieyuanchen, lyxok1, wylin}@sjtu.edu.cn
+                                                                   {chaofan.gan, mehrtash.harandi}@monash.edu
+                                                                      {tjtuyuanpeng, xichen.csai}@gmail.com
+                                                                     https://github.com/ganchaofan0000/DiTF
+
+
+
+                                                                                                        Abstract
+
+                                                    Pre-trained stable diffusion models (SD) have shown great advances in visual corre-
+                                                    spondence. In this paper, we investigate the capabilities of Diffusion Transformers
+                                                    (DiTs) for accurate dense correspondence. Distinct from SD, DiTs exhibit a criti-
+                                                    cal phenomenon in which very few feature activations exhibit significantly larger
+                                                    values than others, known as massive activations, leading to uninformative represen-
+                                                    tations and significant performance degradation for DiTs. The massive activations
+                                                    consistently concentrate at very few fixed dimensions across all image patch tokens,
+                                                    holding little local information. We analyze these dimension-concentrated massive
+                                                    activations and uncover that their concentration is inherently linked to the Adaptive
+                                                    Layer Normalization (AdaLN) in DiTs. Building on these findings, we propose the
+                                                    Diffusion Transformer Feature (DiTF), a training-free AdaLN-based framework
+                                                    that extracts semantically discriminative features from DiTs. Specifically, DiTF
+                                                    leverages AdaLN to adaptively localize and normalize massive activations through
+                                                    channel-wise modulation. Furthermore, a channel discard strategy is introduced to
+                                                    mitigate the adverse effects of massive activations. Experimental results demon-
+                                                    strate that our DiTF outperforms both DINO and SD-based models and establishes
+                                                    a new state-of-the-art performance for DiTs in different visual correspondence
+                                                    tasks (e.g., with +9.4% on Spair-71k and +4.4% on AP-10K-C.S.).
+
+
+                                                  Original feature               Modulating feature with AdaLN                                             Original
+
+                                                                                                                                                           Modulating feature with AdaLN
+                                                                                                                   Performance(PCK@0.1)
+
+
+
+
+                                                                                                                                          SD2-1
+
+
+
+
+                                                                        Dim                               Dim
+
+
+                                                                                                                                          Pixart-Alpha     SD3            SD3-5            Flux
+                                                                     (a) Activation magnitudes                                                       (b) Correspondence performance
+
+                                        Figure 1: AdaLN enhances DiT features by mitigating massive activations. (a) Original DiT
+                                        features show concentrated massive activations. (b) Semantic correspondence performance using
+                                        different features. Original DiT features yield poor performance due to the presence of massive acti-
+                                        vations. By modulating these activations, AdaLN significantly boosts correspondence performance.
+                                           ∗
+                                               Corresponding Author.
+
+
+                                        39th Conference on Neural Information Processing Systems (NeurIPS 2025).
+    Input image           SD2-1               Pixart-Alpha              SD3-5                  Flux
+
+
+
+
+                                  Dim                        Dim                Dim                     Dim
+
+
+
+
+                                  Dim                        Dim                 Dim                    Dim
+
+
+
+
+Figure 2: Massive activations in Diffusion Transformers (DiTs). We visualize the activation
+magnitudes (z-axis) of features across various diffusion models. Unlike the Stable Diffusion (SD2-1)
+model, all DiTs exhibit a distinctive phenomenon where very few feature activations show significantly
+higher activation values, more than 100 times larger than others. We refer to this phenomenon as
+massive activations, which has also been observed in large language models (LLMs) [20].
+
+1    Introduction
+
+Detecting dense correspondence between images plays an important role in various vision tasks such
+as segmentation [1, 2, 3, 4], image editing [5, 6, 7], and point tracking [8, 9, 10, 11]. Various works [12,
+13, 14] utilize pre-trained self-supervised models like DINOv2 [12] to extract image features, which
+are then adapted for precise semantic correspondence. With the advent of text-to-image (T2I)
+generative models [15, 16], recent studies [17, 18, 14] have demonstrated the powerful capability of
+pre-trained SD [15] as an effective feature extractor [14, 18, 19] for visual correspondence.
+Compared with SD, recent DiTs (e.g., Pixart-alpha [21], SD3 [22], and Flux [23]) demonstrate great
+superiority in scalability, robustness, model efficiency, and generation quality. While pre-trained
+SD models have been successfully leveraged as feature extractors, the potential of DiTs for visual
+perception tasks remains largely unexplored. To bridge this gap, we take the first step to investigate
+the feasibility of using pre-trained DiTs as feature extractors for visual correspondence tasks.
+However, when directly extracting the original features for representation learning, as done in SD,
+DiTs exhibit disappointing performance for visual perception tasks, as shown in Figure 1. To better
+understand this discrepancy, we analyze the statistical properties of features extracted from both SD
+and DiTs (see Figure 2). Notably, we observe that DiT feature maps exhibit massive activations, in
+contrast to the smoother distribution observed in SD2.1 [15]. These massive activations share a few
+fixed dominant dimensions, resulting in a high degree of directional similarity for feature vectors
+in the latent space [24]. This property makes it difficult to distinguish spatial feature vectors using
+cosine similarity, leading to semantically uninformative and indiscriminate representations.
+In this work, we aim to deepen the understanding of massive activations for representation learning,
+thereby enabling the extraction of semantically discriminative representations from DiTs. We begin by
+investigating the spatial and dimensional properties of these activations and find that they consistently
+emerge in a small set of fixed feature dimensions across all image tokens, which carry limited local
+information that is crucial for our task. Further analysis reveals an intriguing connection between
+massive activations and the AdaLN in DiTs, where the concentrated dimensions of massive activations
+align with the residual scaling factors produced by AdaLN. To further understand this phenomenon,
+we investigate the role of AdaLN in modulating DiT features. Our findings reveal that the built-in
+AdaLN effectively localizes massive activations and performs semantically meaningful channel-wise
+modulation to suppress them, thereby enhancing the semantic richness and discriminative capacity of
+DiT features.
+Based on these findings, we propose a training-free AdaLN-based framework: Diffusion Transformer
+Feature (DiTF), to extract structural and semantic features from DiTs. Specifically, DiTF leverages the
+built-in AdaLN in DiTs to adaptively normalize massive activations through channel-wise modulation.
+In addition, a channel discard strategy is introduced to further mitigate the adverse effects of massive
+activations on representation learning. Our main contributions are summarized as follows.
+
+
+                                                      2
+       • We identify and characterize massive activations in DiTs and find them consistently concen-
+         trated in a small number of fixed feature dimensions across all spatial tokens.
+       • We analyze the source of these dimensionally concentrated massive activations and uncover
+         their strong connection to the AdaLN layer in DiTs.
+       • We propose a training-free AdaLN-based framework, Diffusion Transformer Feature (DiTF),
+         for extracting semantically discriminative representations from DiTs.
+       • Our framework outperforms both DINO and SD-based models, establishing a new state-of-
+         the-art for Diffusion Transformers on visual correspondence tasks.
+
+2   Related Work
+Visual Correspondence. Visual correspondence aims to establish dense correspondence between two
+different images, which plays a crucial role in various visual tasks such as segmentation [1, 2, 3, 4],
+image editing [5, 6, 7], and point tracking [8, 9, 10, 11]. Early methods like HOG [25], and SIFT [26]
+design hand-crafted features with scale-invariant key-points and then establish image correspondences.
+Various works attempt to learn image correspondence in a supervised learning regime. However, the
+supervised-based methods [27, 28, 29, 30, 31] depend on ground-truth correspondence annotations,
+which are challenging to apply to datasets lacking precise correspondence annotations. To handle
+this challenge, some studies have employed DINO [12, 32] and Generative Adversarial Networks
+(GAN) [33] to extract visual features for correspondence. More recently, [34, 14, 19, 35] have
+demonstrated that SD models can serve as effective feature extractors for various perception tasks.
+Diffusion Model. Large-scale pre-trained diffusion models [15, 36, 37, 38, 16] are capable of
+producing high-quality images with reasonable structures and compositional semantics, indicating
+their robust spatial awareness and semantic understanding capabilities. Consequently, numerous
+studies have utilized pre-trained SD models as feature extractors, extracting features from images for
+visual perception tasks [39, 40, 41, 42]. Inspired by these works, [17] and [18] have employed the
+pre-trained SD model [15], as a representation learner for visual correspondence. In addition, [14]
+investigated the distinct properties of SD features compared to the DINO [35] feature, and jointly
+leveraged them for improved performance. Based on this, GeoAware-SC [43] proposes adaptive pose
+alignment to improve the geometric awareness of the SD features.
+Massive Activations. Massive activations have been extensively studied in large language models
+(LLMs) [20, 44, 45]. Several works [20, 46] have shown that these activations are concentrated
+in a small number of fixed dimensions, particularly in the start and delimiter tokens. [47] further
+revealed that the massive values in the query and key vectors originate from the positional encoding
+mechanism RoPE[48]. In addition to LLMs, similar phenomena have also been observed in Vision
+Transformers (ViTs)[13, 49, 20]. Specifically, [20] identified attention artifacts in ViT feature maps,
+predominantly appearing in low-information background regions. DVT [49] further traced these
+artifacts to the influence of positional embeddings. Recent studies on accelerating DiTs [50, 51] have
+identified massive activation outliers in DiTs and revealed that these outliers lead to unstable model
+quantization and excessively high distillation losses during knowledge distillation.
+
+3   Preliminaries
+Adaptive Layer Norm. AdaLN operation AdaLN(z; γ, β) adaptively normalizes feature z with the
+adaptive scale γ and shift β parameters.
+                                 ẑ = (1 + γ) LayerNorm (z) + β                          (1)
+where LayerNorm is the layernorm operation [52].
+DiT Architecture. We follow the architecture used in [36]. DiT [36] comprises two parts: a VAE
+[53], which comprises an encoder E and a decoder D to project images from pixel space to latent
+space, and diffusion transformer blocks A = {Ak }N  k=1 , where k is the index and N is the number
+of blocks. Given an input image x0 , we first encode it to the latent representation z0 = E (x0 ) with
+the encoder E and then add corresponding noise ϵ to the latent to obtain a noisy latent representation
+zt ∈ RC×H×W according to a pre-defined timestep t. The DiT block Ak encodes the original feature
+ztk as follows:
+                                     ztk+1 = ztk + αk Ak (ztk )                                     (2)
+
+
+                                                  3
+                      Dim                                                                          Dim
+                                                  Dim                                Dim
+
+
+
+
+Figure 3: Massive Activations in SD3-5. We visualize the activation magnitudes of four different
+image features extracted using SD3-5. Notably, massive activations consistently distribute in a fixed
+dimension (676) across all image patch tokens.
+where each Diffusion Transformer block employs residual connections [54], with αk representing the
+residual scaling factor computed by the AdaLN-zero layer. It is important to note that the original
+feature throughout this paper is denoted as ztk , and our analysis of massive activations is conducted
+based on this representation.
+DiT block Ak . DiT block [36] includes a modulation layer called AdaIN-zero layers [36], which
+regress two groups of scale and shift parameters based on the given timestep t and additional
+conditions (e.g., text embedding c).
+                                   {(γki , βki , αki )}2i=1 = MLPk (t, c)                                (3)
+where MLP is utilized to regress channel-wise scale and shift parameters γki , βki , αki ∈ RC . γki , βki
+served as parameters for ith AdaLN and αki is applied to scale ith residual connections.
+Next, the block-input feature ztk is passed through the Self-Attention layer to yield intermediate
+         (k,2)
+feature zt .
+                                       (k,1)                (k,1)
+                                    ẑt        = AdaLN(zt           ; γk1 , βk1 )                        (4)
+                               (k,2)                    (k,1)      (k,1)
+                              zt     = Self-Attention(ẑt ) + αk1 zt                                     (5)
+                                   (k,2)
+Finally, the intermediate feature zt       is fed into the Feedforward layer to yield block-output feature
+ (k+1,1)
+zt       .
+                                       (k,2)                (k,2)
+                                    ẑt        = AdaLN(zt           ; γk2 , βk2 )                        (6)
+                               (k+1,1)                        (k,2)                 (k,2)
+                             zt           = Feedforward(ẑt           ) + αk2 zt                         (7)
+        (k,1)      (k+1,1)
+where zt      and zt        denote the same features as ztk and ztk+1 , respectively. For clarity, we refer
+    (k,1)      (k,2)                                                 (k,1)       (k,2)
+to zt     and zt     as the pre-AdaLN intermediate features, and ẑt       and ẑt     as the post-AdaLN
+intermediate features in the subsequent sections. The residual scaling factor αk in Equation (2)
+corresponds to αk2 . For simplicity, we use AdaLN to refer to the AdaLN-zero module in DiTs
+throughout this paper. See the Appendix A for an illustration of DiTs architecture [36].
+
+4     DiTF: Diffusion Transformer Feature
+In this section, we explore how to eliminate the undesirable effects of massive activations and
+extract semantically meaningful features from DiTs. Specifically, we first analyze the spatial and
+dimensional characteristics of massive activations in DiTs, then discuss why the AdaLN layer is
+well-suited to addressing massive activation in the context of representation learning, and finally
+present our approach for extracting semantic-discriminative features from DiTs.
+
+4.1   Massive Activations in Diffusion Transformers
+Massive activations are high-magnitude scalar values. We first introduce a quantitative criterion
+to characterize massive activations in DiT features. Following the definition proposed for LLMs [20],
+we adopt a generalized formulation: an activation is considered a massive activation if its magnitude
+is approximately 100 times greater than the median magnitude within its feature map. It is notable that
+massive activations are scalar values, which are determined jointly by the patch and dimensions [20].
+
+
+                                                        4
+Table 1: Massive activations exhibit relatively low variance compared to non-massive activa-
+tions. We present the mean and variance of activation values across image patches for selected
+feature dimensions ranked by average magnitude. The 1st-ranked dimension (massive activations)
+shows substantially lower variance relative to its mean compared to the 10th and 20th (no-massive
+activations), indicating limited local information.
+      Model               1st                  2th              10th                20th          Median
+      SD3-5          -44.51±0.50           2.03±1.39        -0.18±2.36          -0.25±2.07         0.21
+      Flux           40.66±3.99           -31.62±8.50       -0.41±3.16          0.49±2.92          0.13
+
+      Original feature             Residual scale            Original feature           Residual scale
+
+
+
+
+                         Dim                                                    Dim
+
+
+
+
+                         SD3-5                                                  Flux
+
+Figure 4: Massive activations dimensions align with the residual scaling factor αk . We visualize
+the magnitudes for the original feature zkt+1 and residual scaling factor αk .
+Massive activations are present in very few fixed dimensions. We identify the dimensional
+locations of massive activations within the original DiT feature. As shown in Figure 3, the SD3-5
+model exhibits massive activations concentrated in a single feature dimension (676). Similarly, in
+the Flux model, massive activations appear in two specific dimensions (154 and 1446). Analyses
+of other DiTs are provided in the Appendix. These observations suggest that massive activations
+consistently occur in a small number of fixed feature dimensions, which aligns with similar findings
+in LLMs [20].
+Massive activations appear across all spatial tokens. As shown in Figures 2 and 3, massive
+activations consistently appear across all image patch tokens, regardless of the input image. For
+instance, in the SD3-5 model, the 676th feature dimension exhibits massive activations across all
+patch tokens. This phenomenon differs from the observations in LLMs and Vision Transformers
+(ViTs). Specifically, [20] reported that massive activations in LLMs are primarily concentrated in
+special tokens such as start and delimiter tokens, while [13] found that outlier activations in ViTs
+tend to emerge in low-information tokens.
+Massive activations hold little local information. To better understand the nature of massive
+activations, we analyze their spatial variance by measuring the mean and variance of feature values
+across image patches. Feature dimensions are ranked by their averaged activation magnitude across
+patches. We then compare the top-ranked dimension (massive activations) with the 10th and 20th
+highest-ranked (non-massive) dimensions to assess their spatial discriminability. As shown in Table 1,
+the variance of the massive activations (1st) is substantially lower relative to its mean compared to
+the non-massive activations (10th and 20th), indicating that massive activations are less spatially
+discriminative. This suggests that massive activations encode limited local information.
+AdaLN enables accurate localization of massive activations. It can be seen that the original
+features in DiTs are computed as ztk+1 = ztk + αk Ak (ztk ) via residual connections, where a scaling
+factor αk is applied to weight the block output Ak (ztk ) (see Equation (2)). To examine the potential
+link between massive activations and the residual scaling factor αk , we analyze their dimensional
+correspondence in Figure 4 and observe that they consistently co-occur in the same channels. Notably,
+αk is regressed by the AdaLN-zero layer, suggesting that AdaLN-zero enables accurate localization
+of massive activations.
+
+4.2    Channel-wise Modulation with AdaLN
+
+Based on these observations, we hypothesize that AdaLN aggregates the activations in the block
+output into the dimension corresponding to the highest values in the scaling factor αk , resulting
+in dimension-concentrated massive activations. While such concentration may not be inherently
+
+
+                                                        5
+    Input image             Pre-AdaLN              Post-AdaLN                Pre-AdaLN       Post-AdaLN
+
+
+
+
+                  SD3-5
+                                        Dim
+                                                                Dim
+
+
+
+
+                  Flux
+
+                                         Dim
+                                                                 Dim
+
+
+
+
+Figure 5: AdaLN reduces massive activations and enhances feature semantics and discrimination.
+We visualize the activation magnitudes and feature maps of both pre-AdaLN and post-AdaLN features
+in DiT block.
+problematic, we argue that it is suboptimal for representation learning. Therefore, we further
+investigate how AdaLN interacts with the original features and massive activations within them.
+AdaLN alleviates massive activations. To better understand how AdaLN interacts with massive
+activations, we compare the properties of pre-AdaLN and post-AdaLN intermediate features within
+DiT blocks. As shown in Figure 5, massive activations in feature channels are significantly reduced
+after AdaLN processing. This suggests that AdaLN can effectively identify such concentrated
+activations and adaptively normalize them through channel-wise modulation, using the scaling and
+shifting parameters.
+AdaLN enhances feature spatial semantics and discrimination. Furthermore, we visualize
+different feature maps in Figure 5. It can be observed that the pre-AdaLN feature maps in DiTs
+exhibit limited semantic coherence, primarily capturing low-level textures such as object color (e.g.,
+the cow and bird), and show weak discrimination between objects and background. In contrast, the
+post-AdaLN features display markedly improved spatial coherence and clearer semantic boundaries
+across object parts, suggesting that AdaLN improves spatial semantics and feature discrimination.
+More visualization results can be found in the Appendix, where the same phenomenon is observed.
+
+4.3    Extracting features from Diffusion Transformers
+
+Based on these observations, we propose to extract DiT features with the channel-wise modulation
+by AdaLN. Specifically, the feature extraction process in DiTs can be decomposed into two stages:
+(1) extracting the original feature ztk from the DiT block Ak , and (2) modulating it via adaptive
+channel-wise scaling and shifting using the AdaLN layer.
+                              ztk = Ak (ztk−1 ),     γk , βk = MLPk (t, c)                            (8)
+                                ẑtk = (1 + γk ) LayerNorm     ztk + βk
+                                                                  
+                                                                                                      (9)
+where ztk is the intermediate pre-AdaLN feature, omitting the index i for clarify. ẑtk denotes the final
+extracted feature. For simplicity, we refer to it as ẑ in the following section.
+Channel discard. As shown in Figure 5, it can be observed that the post-AdaLN features still
+exhibit a few weakly massive activations, which will slightly compromise the local semantics of
+feature maps. Therefore, we propose a simple yet effective channel discard strategy to further suppress
+their influence. Specifically, we zero out the corresponding dimensions of these weakly massive
+activations in the post-AdaLN features as they hold little local information.
+
+5     Experiments
+5.1    Experimental Setup
+
+Model Variants. We evaluate our strategies on four different pre-trained DiTs: Pixart-alpha [21],
+SD3 [22], SD3-5 [22], and Flux [23]. The channel-wise modulation with AdaLN operation for DiTs
+is conditioned on the input timestep t and text embedding c, except for Pixart-alpha [21], which
+
+
+                                                     6
+Table 2: Performance comparison on dataset SPair-71k. We present per-class and average
+PCK@0.10 on the test split. The compared methods are divided into two categories: supervised (S)
+and unsupervised (U). We report PCK per point results for the (U) methods and PCK per image
+results for the (S) methods, following [43]. †: Integrating DINOv2 features for correspondence. The
+highest mAPs are highlighted in bold, while the second highest mAPs are underlined.
+  Method             Aer Bike Bird Boat Bottle Bus Car Cat Chair Cow Dog Horse Motor Person Plant Sheep Train TV V All
+S SCOT [55]          34.9 20.7 63.8 21.1 43.5 27.3 21.3 63.1 20.0 42.9 42.5 31.1 29.8 35.0 27.7 24.4 48.4 40.8 35.6
+  PMNC [27]          54.1 35.9 74.9 36.5 42.1 48.8 40.0 72.6 21.1 67 58.1 50.5 40.1 54.1 43.3 35.7 74.5 59.9 50.4
+  SCorrSAN [28]      57.1 40.3 78.3 38.1 51.8 57.8 47.1 67.9 25.2 71.3 63.9 49.3 45.3 49.8 48.8 40.3 77.7 69.7 55.3
+  CATs++ [29]        60.6 46.9 82.5 41.6 56.8 64.9 50.4 72.8 29.2 75.8 65.4 62.5 50.9 56.1 54.8 48.2 80.9 74.9 59.8
+  DHF [34]           74.0 61.0 87.2 40.7 47.8 70.0 74.4 80.9 38.5 76.1 60.9 66.8 66.6 70.3 58.0 54.3 87.4 60.3 64.9
+  SD+DINO (S) [14] 81.2 66.9 91.6 61.4 57.4 85.3 83.1 90.8 54.5 88.5 75.1 80.2 71.9 77.9 60.7 68.9 92.4 65.8 74.6
+U ASIC [56]          57.9 25.2 68.1 24.7 35.4 28.4 30.9 54.8 21.6 45.0 47.2 39.9 26.2 48.8 14.5 24.5 49.0 24.6 36.9
+  DINOv2+NN [12] 72.7 62.0 85.2 41.3 40.4 52.3 51.5 71.1 36.2 67.1 64.6 67.6 61.0 68.2 30.7 62.0 54.3 24.2 55.6
+  DIFT [18]          63.5 54.5 80.8 34.5 46.2 52.7 48.3 77.7 39.0 76.0 54.9 61.3 53.3 46.0 57.8 57.1 71.1 63.4 57.7
+  DiTFsd3-5 (ours)   66.5 56.8 86.3 40.1 51.3 58.6 58.8 81.3 47.8 79.6 60.2 68.5 65.7 73.5 64.4 67.8 69.7 66.5 64.6
+  DiTFflux (ours)    74.3 65.0 88.1 48.1 53.2 60.7 60.7 84.9 42.4 82.8 68.4 72.1 70.9 74.2 62.1 72.6 66.0 60.3 67.1
+             †
+  SD+DINO [14]       73.0 64.1 86.4 40.7 52.9 55.0 53.8 78.6 45.5 77.3 64.7 69.7 63.3 69.2 58.4 67.6 66.2 53.5 64.0
+  GeoAware-SC† [43] 78.0 66.4 90.2 44.5 60.1 66.6 60.8 82.7 53.2 82.3 69.5 75.1 66.1 71.7 58.9 71.6 83.8 55.5 69.6
+                   †
+  DiTFsd3-5 (ours)   79.1 67.8 90.6 48.3 56.1 69.2 65.0 85.7 59.4 84.6 72.6 76.7 69.9 75.5 62.1 74.4 85.6 59.6 72.2
+  DiTFflux (ours)†   76.3 67.8 88.5 50.8 55.8 60.9 60.8 82.9 47.1 81.3 70.5 72.3 70.0 76.2 62.6 72.5 64.8 56.5 67.6
+Table 3: Performance comparison on datasets SPair-71k, AP-10K, and PF-Pascal datasets at
+different PCK levels. We report the performance of the AP-10K intra-species (I.S.), cross-species
+(C.S.), and cross-family (C.F.) test sets. We report the PCK per image results following [43]. †:
+Integrating DINOv2 features for correspondence. The highest mAPs are highlighted in bold, while
+the second highest mAPs are underlined.
+                                 SPair-71k          AP-10K-I.S.         AP-10K-C.S.         AP-10K-C.F.            PF-Pascal
+      Method
+                          0.01     0.05 0.10   0.01 0.05 0.10       0.01 0.05 0.10      0.01 0.05 0.10      0.05     0.10 0.15
+ S    SCorrSAN [28]        3.6     36.3 55.3     -      -       -     -      -      -     -     -       -   81.5     93.3 96.6
+      CATs++ [29]          4.3     40.7 59.8     -      -       -     -      -      -     -     -       -   84.9     93.8 96.8
+      DHF [34]             8.7     50.2 64.9    8.0    45.8 62.7     6.8   42.4 60.0    5.0    32.7 47.8    78.0     90.4 94.1
+      SD+DINO (S) [14]     9.6     57.7 74.6    9.9    57.0 77.0     8.8   53.9 74.0    6.9    46.2 65.8    80.9     93.6 96.9
+ U    DINOv2+NN [12]       6.3     38.4 53.9    6.4    41.0 60.9     5.3   37.0 57.3    4.4    29.4 47.4    63.0     79.2 85.1
+      DIFT [18]            7.2     39.7 52.9    6.2    34.8 50.3     5.1   30.8 46.0    3.7    22.4 35.0    66.0     81.1 87.2
+      DiTFsd3-5 (ours)     7.9     48.1 61.2    7.6 50.2 63.3        6.6   48.0 60.2    5.8 33.5 47.9       88.5     95.2 97.3
+      DiTFflux (ours)     8.3      49.3 64.0    7.6    49.7 62.2    6.8 48.2 61.7       5.7 34.2 48.9       89.5     95.8 97.6
+      SD+DINO† [14]        7.9     44.7 59.9    7.6    43.5 62.9     6.4   39.7 59.3    5.2    30.8 48.3    71.5     85.8 90.6
+      GeoAware-SC† [43]    9.9     49.1 65.4   11.3 49.8 68.7        9.3   44.9 64.6    7.4    34.9 52.7    74.0     86.2 90.7
+      DiTFsd3-5 (ours)†   11.8     53.1 67.4   15.7 54.4 71.3       13.1 52.0 69.4      9.8 41.4 56.7       89.7     96.2 97.8
+      DiTFflux (ours)†    10.1     50.0 66.0   12.9 52.0 68.8       11.2 49.7 67.1      9.0    39.9 55.6    89.6     95.9 97.6
+
+follows its AdaLN design and is conditioned only on timestep t. Additional experimental details,
+including DiT configurations and hyperparameter settings, are provided in Appendix C.
+Datasets and Evaluation Metric. We evaluate our DiTF on semantic correspondence, geometric
+correspondence, and temporal correspondence. For semantic correspondence, we conduct experi-
+ments on three popular benchmarks: SPair-71k [57], PF-Pascal [58], AP-10K benchmark [43]. The
+AP-10K benchmark [43] is a new large-scale semantic correspondence benchmark built on AP-10K
+[59]. It comprises 2.61 million/36,000 data pairs, and spans three settings: the main intra-species set,
+the cross-species set, and the cross-family set. Following [18, 14], we adopt the percentage of correct
+key-points (PCK) metric. See Appendix for the results of two additional correspondence tasks.
+
+5.2    Main results on semantic correspondence
+
+To evaluate our model DiTF, we conducted two types of semantic correspondence experiments:
+in-category semantic correspondence on SPair-71k [57] and PF-Pascal [58], and cross-category
+semantic correspondence on AP-10K [43].
+In-category Semantic Correspondence We conducted comprehensive experiments across different
+datasets where the results can be found in Tables 2 and 3. From these results, we could obtain the
+following observations: 1) State-of-the-art performance. Overall, our models achieve state-of-
+the-art performance across different datasets. Specifically, our model DiTFsd3−5 (ours)† achieves
+2.6% ↑ on Spair-71k and 2.6% ↑ on AP-10K-I.S. 2) Superior feature extraction capabilities.
+It is readily apparent that our feature extraction models for DiTs, such as DiTFsd3-5 (ours) and
+DiTFflux (ours), outperform traditional feature extractors like SD2-1 (DIFT [18]) and DINOv2 [12]
+across various datasets, demonstrating their strong and robust feature extraction abilities. Specifically,
+our DiTFflux (ours) achieves a performance of 67.1% (9.4% ↑ over DIFT) on the Spair-71k dataset,
+and obtains a performance of 62.2% (1.3% ↑ over DINOv2) on dataset AP-10K-I.S. 3) Feature
+
+
+                                                               7
+                                                  Original                           with AdaLN                     with AdaLN & Channel discard
+
+
+
+
+  Spair-71K AP-10K-I.S. AP-10K-C.S. AP-10K-C.F.          Spair-71K AP-10K-I.S. AP-10K-C.S. AP-10K-C.F.       Spair-71K AP-10K-I.S. AP-10K-C.S. AP-10K-C.F.   Spair-71K AP-10K-I.S. AP-10K-C.S. AP-10K-C.F.
+
+           (a) Pixart-alpha                                                (b) SD3                                            (c) SD3-5                                        (d) Flux
+
+Figure 6: Investigation of the impact of channel modulation with AdaLN and channel discard
+strategy across different datasets.
+ Source Image                              DINOv2                                DIFT                        SD+DINO                           DiTFflux (ours)                Target Image
+
+
+
+
+Figure 7: Visualization of semantic correspondence prediction on SPair-71k using different
+features. Different colors represent different key points where circles denote correctly predicted
+points under the threshold αbbox = 0.1 and crosses denote incorrect matches.
+redundancy across DiTs and DINOv2: As shown in Table 2, when integrating DINOv2, our
+DiTFsd3-5 achieves a notable performance increase (from 64.6% to 72.2%). In comparison, our
+DiTFflux shows a limited improvement, only a 0.5% gain (from 67.1% to 67.6%). We interpret
+this performance discrepancy from feature alignment. FLUX aligns closely with DINOv2, causing
+redundancy, while SD3.5 benefits more from DINOv2’s complementary distribution. This alignment
+may arise from two factors: Improved alignment between diffusion models and DINOv2 with larger
+models and longer training [60]; Overlap in training data.
+Cross-category Semantic Correspondence In addition, we conducted cross-category semantic
+correspondence experiments on the AP-10K dataset, as shown in Table 3. The results indicate that
+our models enable the extraction of accurate semantic features for cross-category image pairs and the
+drawing of correct correspondences, outperforming the previous best method, GeoAware-SC [43], by
+nearly 4.8% (64.6% to 69.4%)on AP-10K-C.S. Furthermore, the results show that previous methods,
+such as DINOv2 and DIFT, experience significant performance degradation on the cross-category
+task. In contrast, our model demonstrates stronger robustness for the cross-category correspondence.
+
+5.3      Further analysis
+
+Evaluation of Channel Modulation with AdaLN. We conducted comprehensive semantic cor-
+respondence experiments across different datasets on various DiTs. The results, as depicted in
+Figure 6 and Table 4, reveal several key observations: 1) Effectiveness. When integrated with the
+channel modulation by AdaLN, all the DiT models experience an absolute performance boost of more
+than 20%, demonstrating that AdaLN is capable of effectively mitigating massive activations and
+
+
+                                                                                                         8
+Table 4: Ablation study of our model DiTFflux on
+the dataset SPair-71k and AP-10K. We report the PCK Table 5: Conditions ablation study of AdaLN for
+per point for SPair-71k and PCK per image for feature channel-wise modulation on SPair-71k. We
+AP-10K-I.S.                                         report the PCK@0.10 per point.
+
+                       SPair-71k    AP-10K-I.S.        Condition   Pixart-Alpha   SD3    SD3-5   Flux
+    Model Variants                                      original       35.6       24.8    39.8   29.9
+                   0.01 0.05 0.10 0.01 0.05 0.10
+   Original         2.3 14.6 29.9 2.4 16.5 33.9            c             -        17.9    36.8   20.3
+ + AdaLN            7.8 52.3 65.3 6.4 46.8 60.3             t          55.3       54.6    58.2   60.9
+ + Channel discard 8.3 56.3 67.1 7.6 49.7 62.2           t&c             -        54.9    58.3   63.6
+
+                                                       Table 6: Semantic segmentation on ADE20K.
+                                                       Method                       mIoUss mIoUms
+                                                       self-supervised pre-training
+                                                       DINOv2 [12]                   47.7   53.1
+                                                       SD-based pre-training
+                                                       VPD [42]                      53.7   54.4
+                                                       DiTs-based pre-training
+Figure 8: Visualization of multi-to-multi correspon-   DiTFflux (w/o AdaLN)          43.8   44.8
+dences with our model. Green lines indicate correct    DiTFflux                      53.6   54.8
+matches and red incorrect
+enhancing feature semantics and discrimination. 2) Robustness. These results indicate that channel
+modulation with AdaLN enables the accurate normalization of features across different categories,
+leading to significant improvements on cross-category datasets.
+Evaluation of Channel Discard strategy. As shown in Figure 6 and Table 4. We can observe that
+our channel discard strategy can effectively locate and eliminate the weakly massive activations in
+the DiT feature across different DiTs, leading to smoother feature maps and higher correspondence
+matching accuracy.
+Impact of conditions in AdaLN for Channel-wise Modulation. From the results in Table 5, we
+can observe that the timestep t is essential for modulating massive activations, bringing a significant
+performance boost. In contrast, attempting to modulate features solely based on c proves ineffective.
+This phenomenon arises from the inherent nature of DiTs. During training, DiTs introduce noise to
+images at varying levels of t, making the timestep an essential condition for feature modulation. It
+serves as a key factor in locating the channel positions of massive activations and enhancing feature
+quality, enabling their transformations into a clean and semantically meaningful representation.
+Qualitative Results. We visualize some semantic correspondence predictions from different models
+in Figures 7 and 8. The visualization reveals that our DiT-based model yields robust and accurate
+correspondences across various complex scenes, including changes in viewpoint, multiple objects,
+and dense matching. These results demonstrate the superiority and robustness of our models.
+
+5.4   Other Task: Semantic Segmentation
+
+To assess the generalizability of DiTF, we conduct semantic segmentation experiments on
+ADE20K [61]. We extract activated DiT features using DiTF without applying the channel dis-
+card strategy and train a segmentation head following DINOv2 [12]. As shown in Table 6, DiTFflux
+outperforms DINOv2, with channel modulation of AdaLN significantly enhancing feature semantics
+and discriminability, leading to a substantial mIoU improvement (from 44.8 to 54.8). These results
+highlight the effectiveness and broad applicability of our approach.
+
+6     Conclusion
+In this paper, we identify and characterize massive activations in Diffusion Transformers (DiTs).
+We observe that these activations consistently emerge in a few fixed dimensions across all image
+patch tokens and carry limited local information. We further demonstrate that the built-in AdaLN
+mechanism in DiTs effectively suppresses massive activations while enhancing feature semantics and
+discriminability. Building on these insights, we propose a training-free AdaLN-based framework,
+Diffusion Transformer Feature (DiTF), which extracts semantically discriminative features from DiTs
+through channel-wise modulation using AdaLN. Extensive experiments on visual correspondence
+tasks validate the robustness and effectiveness of our approach.
+
+
+                                                   9
+7   Limitations and Future Work.
+In this work, we primarily focus on understanding and mitigating massive activations in Diffusion
+Transformers (DiTs) from the perspective of representation learning. However, the emergence and
+potential roles of massive activations in the generative process of DiTs remain underexplored. We
+believe that investigating these activations from a generative viewpoint could provide deeper insights
+into their underlying mechanisms and potentially contribute to improving generative performance.
+
+Acknowledgements
+The paper is supported in part by the National Natural Science Foundation of China (No. U21B2013,
+62325109), and in part by the Shanghai ’The Belt and Road’ Young Scholar Exchange Grant
+(24510742000). Mehrtash Harandi is supported by the Australian Research Council (ARC) Discovery
+Program DP250100262.
+
+
+
+
+                                                 10
+References
+ [1] Shilong Liu, Lei Zhang, Xiao Yang, Hang Su, and Jun Zhu. Unsupervised part segmentation
+     through disentangling appearance and shape. In CVPR, 2021.
+ [2] Mark Hamilton, Zhoutong Zhang, Bharath Hariharan, Noah Snavely, and William T Freeman.
+     Unsupervised semantic segmentation by distilling feature correspondences. arXiv:2203.08414,
+     2022.
+ [3] Yang Liu, Muzhi Zhu, Hengtao Li, Hao Chen, Xinlong Wang, and Chunhua Shen. Matcher:
+     Segment anything with one shot using all-purpose feature matching. arXiv:2305.13310, 2023.
+ [4] Aliasghar Khani, Saeid Asgari Taghanaki, Aditya Sanghi, Ali Mahdavi Amiri, and Ghassan
+     Hamarneh. Slime: Segment like me. arXiv:2309.03179, 2023.
+ [5] Yuval Alaluf, Daniel Garibi, Or Patashnik, Hadar Averbuch-Elor, and Daniel Cohen-Or. Cross-
+     image attention for zero-shot appearance transfer. In SIGGRAPH, 2024.
+ [6] Pan Zhang, Bo Zhang, Dong Chen, Lu Yuan, and Fang Wen. Cross-domain correspondence
+     learning for exemplar-based image translation. In CVPR, 2020.
+ [7] Sooyeon Go, Kyungmook Choi, Minjung Shin, and Youngjung Uh. Eye-for-an-eye: Appearance
+     transfer with semantic correspondence in diffusion models. arXiv:2406.07008, 2024.
+ [8] Bin Yan, Yi Jiang, Peize Sun, Dong Wang, Zehuan Yuan, Ping Luo, and Huchuan Lu. Towards
+     grand unification of object tracking. In ECCV, 2022.
+ [9] Nikita Karaev, Ignacio Rocco, Benjamin Graham, Natalia Neverova, Andrea Vedaldi, and
+     Christian Rupprecht. Cotracker: It is better to track together. arXiv:2307.07635, 2023.
+[10] Qianqian Wang, Yen-Yu Chang, Ruojin Cai, Zhengqi Li, Bharath Hariharan, Aleksander
+     Holynski, and Noah Snavely. Tracking everything everywhere all at once. In ICCV, 2023.
+[11] Narek Tumanyan, Assaf Singer, Shai Bagon, and Tali Dekel. Dino-tracker: Taming dino for
+     self-supervised point tracking in a single video. In ECCV, 2024.
+[12] Maxime Oquab, Timothée Darcet, Théo Moutakanni, Huy Vo, Marc Szafraniec, Vasil Khalidov,
+     Pierre Fernandez, Daniel Haziza, Francisco Massa, Alaaeldin El-Nouby, et al. Dinov2: Learning
+     robust visual features without supervision. arXiv:2304.07193, 2023.
+[13] Timothée Darcet, Maxime Oquab, Julien Mairal, and Piotr Bojanowski. Vision transformers
+     need registers. arXiv:2309.16588, 2023.
+[14] Junyi Zhang, Charles Herrmann, Junhwa Hur, Luisa Polania Cabrera, Varun Jampani, Deqing
+     Sun, and Ming-Hsuan Yang. A tale of two features: Stable diffusion complements dino for
+     zero-shot semantic correspondence. NeurIPS, 2024.
+[15] Robin Rombach, Andreas Blattmann, Dominik Lorenz, Patrick Esser, and Björn Ommer.
+     High-resolution image synthesis with latent diffusion models. In CVPR, 2022.
+[16] Chitwan Saharia, William Chan, Saurabh Saxena, Lala Li, Jay Whang, Emily L Denton, Kamyar
+     Ghasemipour, Raphael Gontijo Lopes, Burcu Karagol Ayan, Tim Salimans, et al. Photorealistic
+     text-to-image diffusion models with deep language understanding. NeurIPS, 2022.
+[17] Eric Hedlin, Gopal Sharma, Shweta Mahajan, Hossam Isack, Abhishek Kar, Andrea Tagliasac-
+     chi, and Kwang Moo Yi. Unsupervised semantic correspondence using stable diffusion. NeurIPS,
+     2024.
+[18] Luming Tang, Menglin Jia, Qianqian Wang, Cheng Perng Phoo, and Bharath Hariharan. Emer-
+     gent correspondence from image diffusion. Advances in Neural Information Processing Systems,
+     36:1363–1389, 2023.
+[19] Xinghui Li, Jingyi Lu, Kai Han, and Victor Adrian Prisacariu. Sd4match: Learning to prompt
+     stable diffusion model for semantic matching. In CVPR, 2024.
+
+
+                                               11
+[20] Mingjie Sun, Xinlei Chen, J Zico Kolter, and Zhuang Liu. Massive activations in large language
+     models. arXiv preprint arXiv:2402.17762, 2024.
+[21] Junsong Chen, Jincheng Yu, Chongjian Ge, Lewei Yao, Enze Xie, Yue Wu, Zhongdao Wang,
+     James Kwok, Ping Luo, Huchuan Lu, et al. Pixart-alpha: Fast training of diffusion transformer
+     for photorealistic text-to-image synthesis. arXiv:2310.00426, 2023.
+[22] Patrick Esser, Sumith Kulal, Andreas Blattmann, Rahim Entezari, Jonas Müller, Harry Saini,
+     Yam Levi, Dominik Lorenz, Axel Sauer, Frederic Boesel, et al. Scaling rectified flow transform-
+     ers for high-resolution image synthesis. In ICML, 2024.
+[23] black-forest labs.           Flux.                         https://blackforestlabs.ai/
+     announcing-black-forest-labs/, 2024.
+[24] Mengcheng Lan, Chaofeng Chen, Yiping Ke, Xinjiang Wang, Litong Feng, and Wayne Zhang.
+     Clearclip: Decomposing clip representations for dense vision-language inference. In European
+     Conference on Computer Vision, pages 143–160. Springer, 2024.
+[25] Navneet Dalal and Bill Triggs. Histograms of oriented gradients for human detection. In CVPR,
+     2005.
+[26] David G Lowe. Distinctive image features from scale-invariant keypoints. IJCV, 2004.
+[27] Jae Yong Lee, Joseph DeGol, Victor Fragoso, and Sudipta N Sinha. Patchmatch-based neigh-
+     borhood consensus for semantic correspondence. In CVPR, 2021.
+[28] Shuaiyi Huang, Luyu Yang, Bo He, Songyang Zhang, Xuming He, and Abhinav Shrivastava.
+     Learning semantic correspondence with sparse annotations. In ECCV, 2022.
+[29] Seokju Cho, Sunghwan Hong, and Seungryong Kim. Cats++: Boosting cost aggregation with
+     convolutions and transformers. TPAMI, 2022.
+[30] Seokju Cho, Sunghwan Hong, Sangryul Jeon, Yunsung Lee, Kwanghoon Sohn, and Seungryong
+     Kim. Cats: Cost aggregation transformers for visual correspondence. NeurIPS, 2021.
+[31] Seungwook Kim, Juhong Min, and Minsu Cho. Transformatcher: Match-to-match attention for
+     semantic correspondence. In CVPR, 2022.
+[32] Mathilde Caron, Hugo Touvron, Ishan Misra, Hervé Jégou, Julien Mairal, Piotr Bojanowski,
+     and Armand Joulin. Emerging properties in self-supervised vision transformers. In ICCV, 2021.
+[33] Ian Goodfellow, Jean Pouget-Abadie, Mehdi Mirza, Bing Xu, David Warde-Farley, Sherjil
+     Ozair, Aaron Courville, and Yoshua Bengio. Generative adversarial networks. Communications
+     of the ACM, 2020.
+[34] Grace Luo, Lisa Dunlap, Dong Huk Park, Aleksander Holynski, and Trevor Darrell. Diffusion
+     hyperfeatures: Searching through time and space for semantic correspondence. NeurIPS, 2024.
+[35] Shir Amir, Yossi Gandelsman, Shai Bagon, and Tali Dekel. Deep vit features as dense visual
+     descriptors. arXiv:2112.05814, 2021.
+[36] William Peebles and Saining Xie. Scalable diffusion models with transformers. In ICCV, 2023.
+[37] Prafulla Dhariwal and Alexander Nichol. Diffusion models beat gans on image synthesis.
+     NeurIPS, 2021.
+[38] Alex Nichol, Prafulla Dhariwal, Aditya Ramesh, Pranav Shyam, Pamela Mishkin, Bob McGrew,
+     Ilya Sutskever, and Mark Chen. Glide: Towards photorealistic image generation and editing
+     with text-guided diffusion models. arXiv:2112.10741, 2021.
+[39] Tomer Amit, Tal Shaharbany, Eliya Nachmani, and Lior Wolf. Segdiff: Image segmentation
+     with diffusion probabilistic models. arXiv:2112.00390, 2021.
+[40] Dmitry Baranchuk, Ivan Rubachev, Andrey Voynov, Valentin Khrulkov, and Artem Babenko.
+     Label-efficient semantic segmentation with diffusion models. arXiv:2112.03126, 2021.
+
+
+                                                12
+[41] Jiarui Xu, Sifei Liu, Arash Vahdat, Wonmin Byeon, Xiaolong Wang, and Shalini De Mello.
+     Open-vocabulary panoptic segmentation with text-to-image diffusion models. In CVPR, 2023.
+[42] Wenliang Zhao, Yongming Rao, Zuyan Liu, Benlin Liu, Jie Zhou, and Jiwen Lu. Unleashing
+     text-to-image diffusion models for visual perception. In ICCV, 2023.
+[43] Junyi Zhang, Charles Herrmann, Junhwa Hur, Eric Chen, Varun Jampani, Deqing Sun, and Ming-
+     Hsuan Yang. Telling left from right: Identifying geometry-aware semantic correspondence. In
+     CVPR, 2024.
+[44] Jun Zhao, Zhihao Zhang, Yide Ma, Qi Zhang, Tao Gui, Luhui Gao, and Xuanjing Huang.
+     Unveiling a core linguistic region in large language models. arXiv preprint arXiv:2310.14928,
+     2023.
+[45] Wujiang Xu, Qitian Wu, Zujie Liang, Jiaojiao Han, Xuying Ning, Yunxiao Shi, Wenfang Lin,
+     and Yongfeng Zhang. SLMRec: Distilling large language models into small for sequential
+     recommendation. In The Thirteenth International Conference on Learning Representations,
+     2025.
+[46] Guangxuan Xiao, Yuandong Tian, Beidi Chen, Song Han, and Mike Lewis. Efficient streaming
+     language models with attention sinks. arXiv preprint arXiv:2309.17453, 2023.
+[47] Mingyu Jin, Kai Mei, Wujiang Xu, Mingjie Sun, Ruixiang Tang, Mengnan Du, Zirui Liu, and
+     Yongfeng Zhang. Massive values in self-attention modules are the key to contextual knowledge
+     understanding. arXiv preprint arXiv:2502.01563, 2025.
+[48] Jianlin Su, Murtadha Ahmed, Yu Lu, Shengfeng Pan, Wen Bo, and Yunfeng Liu. Roformer:
+     Enhanced transformer with rotary position embedding. Neurocomputing, 568:127063, 2024.
+[49] Jiawei Yang, Katie Z Luo, Jiefeng Li, Congyue Deng, Leonidas Guibas, Dilip Krishnan,
+     Kilian Q Weinberger, Yonglong Tian, and Yue Wang. Denoising vision transformers. In
+     European Conference on Computer Vision, pages 453–469. Springer, 2024.
+[50] Gongfan Fang, Kunjun Li, Xinyin Ma, and Xinchao Wang. Tinyfusion: Diffusion transformers
+     learned shallow. In Proceedings of the Computer Vision and Pattern Recognition Conference,
+     pages 18144–18154, 2025.
+[51] Tianchen Zhao, Tongcheng Fang, Haofeng Huang, Rui Wan, Widyadewi Soedarmadji, Enshu
+     Liu, Shiyao Li, Zinan Lin, Guohao Dai, Shengen Yan, Huazhong Yang, Xuefei Ning, and
+     Yu Wang. Vidit-q: Efficient and accurate quantization of diffusion transformers for image and
+     video generation. In The Thirteenth International Conference on Learning Representations,
+     2025.
+[52] Jimmy Lei Ba, Jamie Ryan Kiros, and Geoffrey E Hinton. Layer normalization. arXiv preprint
+     arXiv:1607.06450, 2016.
+[53] Patrick Esser, Robin Rombach, and Bjorn Ommer. Taming transformers for high-resolution
+     image synthesis. In CVPR, 2021.
+[54] Kaiming He, Xiangyu Zhang, Shaoqing Ren, and Jian Sun. Deep residual learning for image
+     recognition. In Proceedings of the IEEE conference on computer vision and pattern recognition,
+     pages 770–778, 2016.
+[55] Yanbin Liu, Linchao Zhu, Makoto Yamada, and Yi Yang. Semantic correspondence as an
+     optimal transport problem. In CVPR, 2020.
+[56] Kamal Gupta, Varun Jampani, Carlos Esteves, Abhinav Shrivastava, Ameesh Makadia, Noah
+     Snavely, and Abhishek Kar. Asic: Aligning sparse in-the-wild image collections. In ICCV,
+     2023.
+[57] Juhong Min, Jongmin Lee, Jean Ponce, and Minsu Cho. Spair-71k: A large-scale benchmark
+     for semantic correspondence. arXiv:1908.10543, 2019.
+[58] Bumsub Ham, Minsu Cho, Cordelia Schmid, and Jean Ponce. Proposal flow. In CVPR, 2016.
+
+
+                                                13
+[59] Hang Yu, Yufei Xu, Jing Zhang, Wei Zhao, Ziyu Guan, and Dacheng Tao. Ap-10k: A benchmark
+     for animal pose estimation in the wild. arXiv:2108.12617, 2021.
+[60] Sihyun Yu, Sangkyung Kwak, Huiwon Jang, Jongheon Jeong, Jonathan Huang, Jinwoo Shin,
+     and Saining Xie. Representation alignment for generation: Training diffusion transformers is
+     easier than you think. arXiv preprint arXiv:2410.06940, 2024.
+[61] Bolei Zhou, Hang Zhao, Xavier Puig, Sanja Fidler, Adela Barriuso, and Antonio Torralba.
+     Scene parsing through ade20k dataset. In Proceedings of the IEEE conference on computer
+     vision and pattern recognition, pages 633–641, 2017.
+[62] Yuki Ono, Eduard Trulls, Pascal Fua, and Kwang Moo Yi. Lf-net: Learning local features from
+     images. NeurIPS, 2018.
+[63] Daniel DeTone, Tomasz Malisiewicz, and Andrew Rabinovich. Superpoint: Self-supervised
+     interest point detection and description. In CVPR workshops, 2018.
+[64] Mihai Dusmanu, Ignacio Rocco, Tomas Pajdla, Marc Pollefeys, Josef Sivic, Akihiko Torii, and
+     Torsten Sattler. D2-net: A trainable cnn for joint detection and description of local features.
+     arXiv:1905.03561, 2019.
+[65] Michał Tyszkiewicz, Pascal Fua, and Eduard Trulls. Disk: Learning local features with policy
+     gradient. NeurIPS, 2020.
+[66] Zixin Luo, Tianwei Shen, Lei Zhou, Jiahui Zhang, Yao Yao, Shiwei Li, Tian Fang, and Long
+     Quan. Contextdesc: Local descriptor augmentation with cross-modality context. In CVPR,
+     2019.
+[67] Jerome Revaud, Cesar De Souza, Martin Humenberger, and Philippe Weinzaepfel. R2d2:
+     Reliable and repeatable detector and descriptor. NeurIPS, 2019.
+[68] Qianqian Wang, Xiaowei Zhou, Bharath Hariharan, and Noah Snavely. Learning feature
+     descriptors using camera pose supervision. In ECCV, 2020.
+[69] Gabriel Ilharco, Mitchell Wortsman, Ross Wightman, Cade Gordon, Nicholas Carlini, Rohan
+     Taori, Achal Dave, Vaishaal Shankar, Hongseok Namkoong, John Miller, Hannaneh Hajishirzi,
+     Ali Farhadi, and Ludwig Schmidt. Openclip, 2021.
+[70] Ning Xu, Linjie Yang, Yuchen Fan, Dingcheng Yue, Yuchen Liang, Jianchao Yang, and Thomas
+     Huang. Youtube-vos: A large-scale video object segmentation benchmark. arXiv preprint
+     arXiv:1809.03327, 2018.
+[71] Yingdong Hu, Renhao Wang, Kaifeng Zhang, and Yang Gao. Semantic-aware fine-grained
+     correspondence. In European Conference on Computer Vision, pages 97–115. Springer, 2022.
+[72] Jia Deng, Wei Dong, Richard Socher, Li-Jia Li, Kai Li, and Li Fei-Fei. Imagenet: A large-
+     scale hierarchical image database. In 2009 IEEE conference on computer vision and pattern
+     recognition, pages 248–255. Ieee, 2009.
+[73] Kaiming He, Haoqi Fan, Yuxin Wu, Saining Xie, and Ross Girshick. Momentum contrast for
+     unsupervised visual representation learning. In Proceedings of the IEEE/CVF conference on
+     computer vision and pattern recognition, pages 9729–9738, 2020.
+[74] Ting Chen, Simon Kornblith, Mohammad Norouzi, and Geoffrey Hinton. A simple framework
+     for contrastive learning of visual representations. In International conference on machine
+     learning, pages 1597–1607. PMLR, 2020.
+[75] Jean-Bastien Grill, Florian Strub, Florent Altché, Corentin Tallec, Pierre Richemond, Elena
+     Buchatskaya, Carl Doersch, Bernardo Avila Pires, Zhaohan Guo, Mohammad Gheshlaghi Azar,
+     et al. Bootstrap your own latent-a new approach to self-supervised learning. Advances in neural
+     information processing systems, 33:21271–21284, 2020.
+[76] Xinlei Chen and Kaiming He. Exploring simple siamese representation learning. In Proceedings
+     of the IEEE/CVF conference on computer vision and pattern recognition, pages 15750–15758,
+     2021.
+
+
+                                                14
+[77] Christoph Schuhmann, Romain Beaumont, Richard Vencu, Cade Gordon, Ross Wightman,
+     Mehdi Cherti, Theo Coombes, Aarush Katta, Clayton Mullis, Mitchell Wortsman, et al. Laion-
+     5b: An open large-scale dataset for training next generation image-text models. Advances in
+     Neural Information Processing Systems, 35:25278–25294, 2022.
+[78] Vassileios Balntas, Karel Lenc, Andrea Vedaldi, and Krystian Mikolajczyk. Hpatches: A
+     benchmark and evaluation of handcrafted and learned local descriptors. In Proceedings of the
+     IEEE conference on computer vision and pattern recognition, pages 5173–5182, 2017.
+[79] Jordi Pont-Tuset, Federico Perazzi, Sergi Caelles, Pablo Arbeláez, Alex Sorkine-Hornung,
+     and Luc Van Gool. The 2017 davis challenge on video object segmentation. arXiv preprint
+     arXiv:1704.00675, 2017.
+[80] Xueting Li, Sifei Liu, Shalini De Mello, Xiaolong Wang, Jan Kautz, and Ming-Hsuan Yang.
+     Joint-task self-supervised learning for temporal correspondence. Advances in Neural Informa-
+     tion Processing Systems, 32, 2019.
+
+
+
+
+                                               15
+                                                        Appendix
+A     Diffusion Transformer Architecture
+
+                                               Noise
+                                                                          Scale
+
+                                                                      Feedforward
+                                             Decoder
+                                                                       Scale, Shift
+                                                                       Layer Norm
+
+                                  Nx       DiT Block                      Scale
+
+                                                                          Self-
+                                                                        Attention
+                                             Encoder
+                                                                       Scale, Shift
+                                                                       Layer Norm            MLP
+
+                                                                     Input Feature           t, c
+                                        Diffusion Transformer         DiT Block with AdaLN
+
+                               Figure 9: DiT architecture illustration.
+We strictly follow the architecture used in DiT [36]. We provide an illustration of the DiT architecture
+as shown in Figure 9.
+
+B     More Visualization Results
+B.1   Massive Activations in DiTs
+
+To further illustrate the emergence of massive activations in DiTs, we provide additional visualization
+results in Figure 13. We show the LayerNorm-normalized activation magnitudes of original features
+from SD2-1 and various DiTs. While SD2-1 exhibits smooth activations, DiTs consistently show
+spikes concentrated in a few fixed dimensions across all patch tokens, revealing a fundamental
+difference that contributes to their degraded performance.
+
+               Original feature                Residual scale             Original feature            Residual scale
+
+
+
+
+                              Pixart-Alpha                                                     SD3
+
+
+
+               Original feature                Residual scale             Original feature            Residual scale
+
+
+
+
+                                  Dim                                                          Dim
+
+
+
+
+                                  SD3-5                                                        Flux
+
+Figure 10: Massive activations dimensions align with the residual scaling factor αk . We visualize
+the magnitudes for the original feature zkt+1 and residual scaling factor αk .
+
+
+B.2   Massive Activations Dimensions Align with Residual Scaling Factor
+
+In this section, we provide additional visualizations to examine the dimensional alignment between
+massive activations and the residual scaling factor αk from the AdaLN layer. As illustrated in Fig-
+
+
+                                                                16
+ure 10, massive activations consistently co-occur with large values of αk in the same dimensions
+across all DiTs.
+
+B.3    Channel-wise Modulation with AdaLN
+
+To comprehensively demonstrate the impact of the built-in AdaLN in DiTs, we provide additional
+visualizations comparing pre-AdaLN and post-AdaLN features across various models, including
+SD3-5 (Figure 11), Pixart-Alpha (Figure 14), SD3 (Figure 15), and Flux (Figure 16). These re-
+sults consistently show that AdaLN accurately localizes and normalizes massive activations, while
+enhancing feature semantics and discrimination through effective channel-wise modulation.
+
+    Input image             Pre-AdaLN           Post-AdaLN               Pre-AdaLN         Post-AdaLN
+
+
+
+
+                                         Dim                 Dim
+
+
+
+
+                                        Dim
+                                                             Dim
+
+
+
+
+                                        Dim                   Dim
+
+
+
+
+                                         Dim                   Dim
+
+
+
+
+             Figure 11: Comparisons of pre-AdaLN and post-AdaLN features in SD3-5.
+
+C     Further Implementation Details
+Configurations of different DiTs. We employ the pre-trained Diffusion Transformers (DiTs) as
+a feature extractor for semantic correspondence. Formally, we decompose the universal feature
+extraction process in DiTs into two stages: (1) extracting the original feature ztk from the DiT block
+Ak , and (2) modulating it via adaptive channel-wise scaling and shifting using the AdaLN layer. For
+                                                                                         (k,2)
+Pixart-alpha [21], SD3 [22], and SD3-5 [22], we first extract the pre-AdaLN feature zt         and then
+activate it as follows.
+                               (k,2)
+                             zt     = Ak (ztk ), γk2 , βk2 = MLPk (t, c)                          (10)
+                                                                  
+                                                             (k,2)
+                             ẑtk = 1 + γk2 LayerNorm zt             + βk2
+                                           
+                                                                                                  (11)
+As some of the Flux [23] model’s blocks contain only one group of AdaLN-zero layer, we extract
+                    (k,1)
+pre-AdaLN feature zt      and then activate it as follows.
+                               (k,1)
+                             zt     = Ak (ztk ), γk1 , βk1 = MLPk (t, c)                          (12)
+                                                                  
+                                                             (k,1)
+                             ẑtk = 1 + γk1 LayerNorm zt             + βk1
+                                           
+                                                                                                  (13)
+
+
+                                                  17
+                SPair-71k @ =0.1
+
+
+
+
+                                                           SPair-71k @ =0.1
+                                   Block index k                                  Timestep t
+
+Figure 12: Investigation of the DiT block index k and timestep t. We report the results of DiTFflux
+on dataset Spair-71k.
+            Table 7: Configurations of different DiTs for semantic correspondence.
+             Method                   Layers N     Hidden size d              Timestep t       Block index k
+             DiTFpixart-α                28           1152                       141                14
+             DiTFSD3                     24           1536                       340                 9
+             DiTFSD3-5                   38           2432                       380                23
+             DiTFflux                    57           3072                       260                28
+
+
+The configurations of different DiTs can be found in Table 7, where the total time step T is 1000. We
+set the input image size as 960x960 for DiTs and 840x840 for the model DINOv2.
+Investigation on block index k and timestep t. The layer index k and the timestep t are critical
+hyperparameters that influence the quality of the extracted features from Diffusion Transformers
+(DiTs). Previous studies [18, 14] have conducted thorough investigations to identify the optimal
+layer index k and timestep t for Stable Diffusion. To explore the effects of varying k and t in DiTs,
+we conducted grid search experiments to identify the optimal hyperparameters. The results are
+presented in Figure 12. The figure reveals that features extracted from the middle layer achieve
+optimal performance across different DiTs. Furthermore, feature extraction in DiTs is robust to the
+timestep for semantic correspondence tasks, as a wide range of t achieves excellent performance.
+Integration of DINOv2 feature. We extracted DINOv2 features from the token facet of the 11th
+layer of the model. We then concatenated the DiT’s features with the DINOv2 features in the
+channel dimension. To improve the efficiency of correspondence calculation, we computed Principal
+Component Analysis (PCA) across the pair of images for the features extracted from DiT, as follows:
+                                     z̃ s , z̃ t = PCA ẑ s ∥ẑ t
+                                                                  
+                                                                                               (14)
+where ẑ s , ẑ t are the extracted source and target image DiT features. We only apply the PCA operation
+to SD3-5 and Flux features due to their high dimension and set the output dimension size as 1280.
+
+D    Geometric Correspondence
+To comprehensively evaluate our model DiTF, we conduct additional experiments on geometric
+correspondence.
+Datasets. Following [18], we evaluate our model on the HPatches benchmark [78], which comprises
+116 sequences: 57 with illumination changes and 59 with viewpoint variations. Adopting the approach
+from CAPS [68], we detect up to 1,000 key points per image and apply cv2.findHomography() to
+estimate homography using mutual nearest neighbor matches.
+Metric. We adopt the corner correctness metric for evaluation where we compute the average error
+between the four estimated corners of one image and the ground-truth corners with a threshold ϵ
+pixels, following [68, 18],.
+Results. To comprehensively evaluate our models, we conducted geometric correspondence ex-
+periments on the HPatches benchmark [78], as detailed in Table 8. From the results, it can be
+observed that our model enables robust feature extraction for image pairs and draws precise geo-
+metric correspondence. Specifically, our model DiTFflux (ours) achieve comparable performance
+41.9% compared to the state-of-the-art model DIFT (SD-based). These results show that Diffusion
+Transformers can be employed as an effective feature extractor for geometric correspondence.
+
+
+                                                         18
+Table 8: Geometric correspondence results on dataset HPatches. We report the homography
+estimation accuracy [%] at 1, 3, 5 pixels.
+                        Geometric            All             Viewpoint Change     Illumination Change
+    Method
+                       Supervision   ϵ=1    ϵ=3    ϵ=5     ϵ=1 ϵ=3 ϵ=5           ϵ=1 ϵ=3 ϵ=5
+    SIFT [26]             None       40.2   68.0   79.3    26.8   55.4    72.1   54.6     81.5    86.9
+    LF-Net [62]                      34.4   62.2   73.7    16.8   43.9    60.7   53.5     81.9    87.7
+    SuperPoint [63]                  36.4   72.7   82.6    22.1   56.1    68.2   51.9     90.8    98.1
+    D2-Net [64]                      16.7   61.0   75.9     3.7   38.0    56.6   30.2     84.9    95.8
+                         Strong
+    DISK [65]                        40.2   70.6   81.5    23.2   51.4    67.9   58.5     91.2    96.2
+    ContextDesc [66]                 40.9   73.0   82.2    29.6   60.7    72.5   53.1     86.2    92.7
+    R2D2 [67]                        40.0   74.4   84.3    26.4   60.4    73.9   54.6     89.6    95.4
+ w/ SuperPoint kp.
+    CAPS [68]            Weak        44.8   76.3    85.2   35.7   62.9   74.3    54.6    90.8    96.9
+    DINO [12]                        38.9   70.0    81.7   21.4   50.7   67.1    57.7    90.8    97.3
+    OpenCLIP [69]                    33.3   67.2    78.0   18.6   45.0   59.6    49.2    91.2    97.7
+                          None
+    DIFT [18]                        45.6   73.9    83.1   30.4   56.8   69.3    61.9    92.3    98.1
+    DiTFflux (ours)                  41.9   70.7    79.5   22.0   50.8   63.4    62.5    91.3    96.2
+
+
+Table 9: Tempral correspondence results on DAVIS-2017. We report the region-based similarity J
+and contour-based accuracy F for DAVIS. Pre-: Pre-trained on videos.
+                                                                   DAVIS
+            Pre-    Method                Dataset
+                                                          J &Fm      Jm      Fm
+                    MAST                                    65.5     63.3    67.6
+            ✓                           YT-VOS [70]
+                    SFC [71]                                71.2     68.3    74.0
+                    InstDis [70]                            66.4     63.9    68.9
+                    MoCo [73]                               65.9     63.4    68.4
+                    SimCLR [74]                             66.9     64.4    69.4
+                                       ImageNet [72]
+                    BYOL [75]                               66.5     64.0    69.0
+                                         w/o labels
+                    SimSiam [76]                            67.2     64.8    68.8
+            ✗
+                    DINO [32]                               71.4     67.9    74.9
+                    OpenCLIP [69]                           62.5     60.6    64.4
+                                        LAION [77]
+                    DIFT [18]                               70.0     67.4    72.5
+                    DiTFflux (ours)                         72.2     69.2    75.1
+E   Temporal Correspondence
+In addition, we conduct experiments to verify the temporal correspondence capability of our DiTF.
+Specifically, we investigate DiTF’s performance on video object segmentation and pose tracking
+tasks, employing DiTs as a feature extractor for correspondence.
+Datasets. We conduct experiments on the challenge video dataset: DAVIS-2017 video instance
+segmentation benchmark [79], following [18].
+Metric. Following [18, 80], we adopt the region-based similarity J and contour-based accuracy F
+as the performance metric where we segment the nearest neighbors between the consecutive video
+frames based on the representation similarity.
+Results. The temporal correspondence results can be found in Table 9. From the results, it can be
+observed that our model exhibits a superior capability to extract video frame features for temporal
+correspondence. Specifically, our model achieves 72.2% on the dataset DAVIS, which outperforms
+the previous state-of-the-art DIFT by 2.2%, demonstrating the superior effectiveness of our model.
+
+F   Qualitative Results on AP-10K
+We show the qualitative comparison of our Diffusion Transformer model DiTF with both Stable
+Diffusion (SD) and SD+DINO [14] in AP-10K intra-species (Figure 17), cross-species ( Figure 18),
+and cross-family ( Figure 19) subset.
+
+
+
+
+                                                   19
+   Input image
+
+
+
+
+  Models
+
+
+
+
+   SD2-1
+
+
+                          Dim                    Dim                     Dim                    Dim
+
+
+
+
+Pixart-Alpha
+
+
+                          Dim                    Dim                     Dim                    Dim
+
+
+
+
+    SD3
+
+
+                            Dim                    Dim
+                                                                          Dim
+                                                                                                Dim
+
+
+
+
+   SD3-5
+
+
+                            Dim
+                                                  Dim                     Dim
+                                                                                               Dim
+
+
+
+
+    Flux
+
+
+                                Dim
+                                                  Dim
+                                                                               Dim               Dim
+
+
+
+
+Figure 13: Massive activations in DiTs. SDv2-1 does not suffer from massive activations. However,
+all DiTs exhibit massive activations, which concentrate on very few fixed dimensions across all image
+patch tokens.
+
+
+
+
+                                                 20
+Input image            Pre-AdaLN           Post-AdaLN               Pre-AdaLN   Post-AdaLN
+
+
+
+
+                                    Dim
+                                                        Dim
+
+
+
+
+                                     Dim
+                                                         Dim
+
+
+
+
+                                   Dim                    Dim
+
+
+
+
+                                    Dim                       Dim
+
+
+
+
+    Figure 14: Comparisons of pre-AdaLN and post-AdaLN features in Pixart-Alpha.
+
+Input image            Pre-AdaLN           Post-AdaLN               Pre-AdaLN   Post-AdaLN
+
+
+
+
+                                    Dim                  Dim
+
+
+
+
+                                     Dim
+                                                         Dim
+
+
+
+
+                                   Dim                    Dim
+
+
+
+
+                                    Dim                       Dim
+
+
+
+
+          Figure 15: Comparisons of pre-AdaLN and post-AdaLN features in SD3.
+
+
+                                            21
+Input image             Pre-AdaLN         Post-AdaLN               Pre-AdaLN     Post-AdaLN
+
+
+
+
+                                    Dim
+
+                                                       Dim
+
+
+
+
+                                    Dim
+                                                        Dim
+
+
+
+
+                                    Dim
+                                                         Dim
+
+
+
+
+                                    Dim
+                                                             Dim
+
+
+
+
+          Figure 16: Comparisons of pre-AdaLN and post-AdaLN features in Flux.
+
+
+
+
+                                           22
+               SD                            SD+DINO                        DiTFflux(ours)
+
+Figure 17: Qualitative comparison on the AP-10K intra-species set. Different colors represent
+different key points where circles denote correctly predicted points and crosses denote for incorrect
+matches.
+
+
+
+
+                                                 23
+ SD                          SD+DINO                     DiTFflux(ours)
+
+Figure 18: Qualitative comparison on the AP-10K cross-species set.
+
+
+
+
+SD                         SD+DINO                      DiTFflux(ours)
+Figure 19: Qualitative comparison on the AP-10K cross-family set.
+
+
+
+
+                               24
