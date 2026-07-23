@@ -34,7 +34,7 @@ def image_tensor(image: Image.Image, max_side: int) -> tuple[torch.Tensor, tuple
     image = image.convert("RGB")
     h, w = image.height, image.width
     out_h, out_w = resize_shape(h, w, max_side)
-    image = image.resize((out_w, out_h), Image.Resampling.BICUBIC)
+    image = image.resize((out_w, out_h), Image.Resampling.LANCZOS)
     array = np.asarray(image, dtype=np.float32) / 255.0
     tensor = torch.from_numpy(array).permute(2, 0, 1)
     mean = torch.tensor((0.485, 0.456, 0.406)).view(3, 1, 1)

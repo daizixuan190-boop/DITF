@@ -5,7 +5,8 @@ from dino_v2_spair import candidate_hit, dino_tokens_to_map, resize_shape, summa
 
 def test_resize_is_aspect_preserving_and_patch_aligned():
     height, width = resize_shape(300, 500, 840)
-    assert width == 840
+    assert height == 840
+    assert width > 840
     assert height % 14 == 0 and width % 14 == 0
 
 
@@ -23,4 +24,3 @@ def test_global_union_detects_transfer_when_owner_misses():
     assert rows[0]["owner_candidate_hit@2"] == 0
     assert rows[0]["other_source_candidate_hit@2"] == 1
     assert rows[0]["global_union_candidate_hit@2"] == 1
-

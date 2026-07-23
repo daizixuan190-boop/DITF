@@ -24,10 +24,17 @@ class DINOConfig:
 
 
 def resize_shape(height: int, width: int, max_side: int, patch_size: int = 14) -> tuple[int, int]:
-    """Return aspect-preserving dimensions divisible by the DINO patch size."""
-    scale = float(max_side) / max(height, width)
-    out_h = max(patch_size, int(round(height * scale / patch_size)) * patch_size)
-    out_w = max(patch_size, int(round(width * scale / patch_size)) * patch_size)
+    """Match the official ViTExtractor ``Resize(int)`` preprocessing.
+
+    An integer torchvision resize sets the *shorter* side to the requested
+    size, preserves aspect ratio, and the extractor then floors both sides to
+    patch-size multiples.  This is deliberately not a longest-side resize.
+    """
+    scale = float(max_side) / min(height, width)
+    resized_h = max(1, int(round(height * scale)))
+    resized_w = max(1, int(round(width * scale)))
+    out_h = max(patch_size, (resized_h // patch_size) * patch_size)
+    out_w = max(patch_size, (resized_w // patch_size) * patch_size)
     return out_h, out_w
 
 
@@ -116,4 +123,3 @@ def summarize_candidate_rows(
             row[f"global_union_candidate_hit@{k}"] = int(owner_hit or other_hit)
         rows.append(row)
     return rows
-
