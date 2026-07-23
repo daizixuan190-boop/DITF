@@ -36,12 +36,14 @@ def image_tensor(image: Image.Image, max_side: int) -> tuple[torch.Tensor, tuple
     _, offset_x, offset_y, out_h, out_w = square_canvas_geometry(h, w, max_side)
     image = image.resize((out_w, out_h), Image.Resampling.LANCZOS)
     array = np.asarray(image, dtype=np.float32) / 255.0
-    # The official DINO evaluator embeds the resized image in a square canvas
-    # using edge padding. Keypoints are transformed to this same canvas below.
+    # The official DINO evaluator's default resize(edge=False) embeds the
+    # resized image in a zero-valued square canvas. Keypoints are transformed
+    # to this same centered canvas below.
     array = np.pad(
         array,
         ((offset_y, max_side - out_h - offset_y), (offset_x, max_side - out_w - offset_x), (0, 0)),
-        mode="edge",
+        mode="constant",
+        constant_values=0.0,
     )
     tensor = torch.from_numpy(array).permute(2, 0, 1)
     mean = torch.tensor((0.485, 0.456, 0.406)).view(3, 1, 1)
