@@ -1,112 +1,159 @@
-"""DINOv2 feature extraction and candidate-ownership diagnostics for SPair.
+"""Shared DINOv2/SPair geometry and nearest-neighbour evaluation utilities.
 
-This module intentionally keeps DINOv2 separate from the Flux evaluator.  It
-uses the Hugging Face DINOv2 implementation and exposes only tensor utilities
-needed by the SPair evaluator, so the exploratory 4090 runs cannot alter the
-official Flux baseline.
+The preprocessing and patch-coordinate protocol follows GeoAware-SC, which is
+the DINOv2 reference implementation cited by DiTF: aspect-preserving resize to
+an 840 square zero canvas, ViT-B/14 block-11 tokens, and a 60x60 patch grid.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Iterable, Sequence
 
+import numpy as np
 import torch
 import torch.nn.functional as F
+from PIL import Image
+
+
+PAPER_DINO_MACRO_POINT = 0.556
+PAPER_DINO_ALL_IMAGE = 0.539
 
 
 @dataclass(frozen=True)
 class DINOConfig:
-    model_name: str = "facebook/dinov2-large"
+    model_name: str = "facebook/dinov2-base"
+    hub_model: str = "dinov2_vitb14"
     layer: int = 11
     patch_size: int = 14
-    max_side: int = 840
+    image_size: int = 840
+
+    @property
+    def grid_size(self) -> int:
+        if self.image_size % self.patch_size:
+            raise ValueError("image_size must be divisible by patch_size")
+        return self.image_size // self.patch_size
 
 
-def resize_shape(height: int, width: int, max_side: int, patch_size: int = 14) -> tuple[int, int]:
-    """Return the resized content shape before square-canvas padding."""
-    scale = float(max_side) / max(height, width)
-    resized_h = max(1, int(round(height * scale)))
-    resized_w = max(1, int(round(width * scale)))
-    out_h = max(patch_size, (resized_h // patch_size) * patch_size)
-    out_w = max(patch_size, (resized_w // patch_size) * patch_size)
-    return out_h, out_w
+@dataclass
+class CategoryMetrics:
+    pair_scores: list[float] = field(default_factory=list)
+    correct: int = 0
+    total: int = 0
+
+    def update(self, hits: torch.Tensor) -> None:
+        hits = hits.detach().bool().cpu()
+        self.pair_scores.append(float(hits.float().mean()))
+        self.correct += int(hits.sum())
+        self.total += int(hits.numel())
+
+    @property
+    def per_image(self) -> float:
+        return float(np.mean(self.pair_scores)) if self.pair_scores else 0.0
+
+    @property
+    def per_point(self) -> float:
+        return self.correct / self.total if self.total else 0.0
 
 
 def square_canvas_geometry(
     height: int, width: int, target_res: int
 ) -> tuple[float, int, int, int, int]:
-    """Return scale, offsets, and resized content shape for official DINO input."""
+    """Return scale, offsets and content size used by GeoAware-SC ``resize``."""
+    if height <= 0 or width <= 0 or target_res <= 0:
+        raise ValueError("image and target dimensions must be positive")
     scale = float(target_res) / max(height, width)
-    resized_h = max(1, int(round(height * scale)))
-    resized_w = max(1, int(round(width * scale)))
+    resized_h = max(1, int(np.around(target_res * height / width))) if height <= width else target_res
+    resized_w = target_res if height <= width else max(1, int(np.around(target_res * width / height)))
     offset_y = (target_res - resized_h) // 2
     offset_x = (target_res - resized_w) // 2
     return scale, offset_x, offset_y, resized_h, resized_w
 
 
-def dino_tokens_to_map(tokens: torch.Tensor, height: int, width: int, patch_size: int = 14) -> torch.Tensor:
-    """Convert patch tokens to ``C,H/patch,W/patch`` without the CLS token."""
-    if tokens.ndim != 3:
-        raise ValueError(f"Expected [B,N,C] tokens, got {tuple(tokens.shape)}")
-    grid_h, grid_w = height // patch_size, width // patch_size
-    expected = grid_h * grid_w
-    if tokens.shape[1] == expected + 1:
-        tokens = tokens[:, 1:, :]
-    if tokens.shape[1] != expected:
-        raise ValueError(
-            f"Token/grid mismatch: N={tokens.shape[1]}, expected {expected} "
-            f"for image {(height, width)} and patch {patch_size}"
-        )
-    return tokens.transpose(1, 2).reshape(tokens.shape[0], tokens.shape[2], grid_h, grid_w)
+def preprocess_square_canvas(image: Image.Image, target_res: int) -> torch.Tensor:
+    """Create the normalized square tensor used by the cited DINOv2 baseline."""
+    image = image.convert("RGB")
+    _, offset_x, offset_y, resized_h, resized_w = square_canvas_geometry(
+        image.height, image.width, target_res
+    )
+    image = image.resize((resized_w, resized_h), Image.Resampling.LANCZOS)
+    canvas = np.zeros((target_res, target_res, 3), dtype=np.uint8)
+    canvas[offset_y : offset_y + resized_h, offset_x : offset_x + resized_w] = np.asarray(image)
+    tensor = torch.from_numpy(canvas.copy()).permute(2, 0, 1).float().div_(255.0)
+    mean = tensor.new_tensor((0.485, 0.456, 0.406)).view(3, 1, 1)
+    std = tensor.new_tensor((0.229, 0.224, 0.225)).view(3, 1, 1)
+    return tensor.sub_(mean).div_(std)
 
 
-def normalize_feature_map(feature_map: torch.Tensor) -> torch.Tensor:
-    """L2-normalize a ``C,H,W`` feature map along its channel dimension."""
-    if feature_map.ndim != 3:
-        raise ValueError(f"Expected [C,H,W], got {tuple(feature_map.shape)}")
-    return F.normalize(feature_map.float(), dim=0, eps=1e-6)
-
-
-def topk_candidate_indices(
-    source_features: torch.Tensor,
-    target_features: torch.Tensor,
-    source_points: Sequence[Sequence[int]],
-    topk: int,
+def transform_points_to_canvas(
+    points: Sequence[Sequence[float]], height: int, width: int, target_res: int
 ) -> torch.Tensor:
-    """Return target-map flat indices for every source keypoint.
-
-    The result has shape ``[num_source_points, topk]``.  Source and target
-    maps must already be resized to the same target/query image coordinates.
-    """
-    src = normalize_feature_map(source_features)
-    trg = normalize_feature_map(target_features)
-    vectors = torch.stack([src[:, int(y), int(x)] for x, y in source_points], dim=0)
-    scores = torch.einsum("nc,chw->nhw", vectors, trg).flatten(1)
-    return scores.topk(min(topk, scores.shape[1]), dim=1).indices
+    """Map original-image ``(x, y)`` points onto the square input canvas."""
+    scale, offset_x, offset_y, _, _ = square_canvas_geometry(height, width, target_res)
+    output = torch.as_tensor(points, dtype=torch.float32).clone()
+    if output.ndim != 2 or output.shape[1] != 2:
+        raise ValueError(f"Expected Nx2 points, got {tuple(output.shape)}")
+    output[:, 0].mul_(scale).add_(offset_x)
+    output[:, 1].mul_(scale).add_(offset_y)
+    return output
 
 
+def tokens_to_patch_map(tokens: torch.Tensor, grid_size: int) -> torch.Tensor:
+    """Convert block tokens into ``B,C,H,W``, dropping all special tokens."""
+    if tokens.ndim != 3:
+        raise ValueError(f"Expected BxNxC tokens, got {tuple(tokens.shape)}")
+    patch_count = grid_size * grid_size
+    if tokens.shape[1] < patch_count:
+        raise ValueError(f"Expected at least {patch_count} patch tokens, got {tokens.shape[1]}")
+    # Patch tokens are last in both standard and register-token DINOv2 models.
+    patches = tokens[:, -patch_count:, :]
+    return patches.transpose(1, 2).reshape(tokens.shape[0], tokens.shape[2], grid_size, grid_size)
+
+
+def points_to_patch_indices(points: torch.Tensor, image_size: int, grid_size: int) -> torch.Tensor:
+    """Map canvas coordinates to flattened source patch indices by floor."""
+    if points.ndim != 2 or points.shape[1] != 2:
+        raise ValueError(f"Expected Nx2 points, got {tuple(points.shape)}")
+    xy = torch.floor(points * (grid_size / image_size)).long().clamp_(0, grid_size - 1)
+    return xy[:, 1] * grid_size + xy[:, 0]
+
+
+def cosine_nn_predictions(
+    source_map: torch.Tensor,
+    target_map: torch.Tensor,
+    source_points: torch.Tensor,
+    image_size: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Match source keypoints to target patch centers with cosine NN."""
+    if source_map.shape != target_map.shape or source_map.ndim != 3:
+        raise ValueError("source and target maps must have identical CxHxW shapes")
+    _, grid_h, grid_w = source_map.shape
+    if grid_h != grid_w:
+        raise ValueError("the official SPair protocol expects a square patch grid")
+    source = F.normalize(source_map.float().flatten(1).transpose(0, 1), dim=1, eps=1e-10)
+    target = F.normalize(target_map.float().flatten(1).transpose(0, 1), dim=1, eps=1e-10)
+    source_indices = points_to_patch_indices(source_points, image_size, grid_h).to(source.device)
+    scores = source[source_indices] @ target.transpose(0, 1)
+    best_scores, target_indices = scores.max(dim=1)
+    stride = image_size / grid_h
+    pred_x = (target_indices % grid_w).float() * stride + stride / 2
+    pred_y = torch.div(target_indices, grid_w, rounding_mode="floor").float() * stride + stride / 2
+    return torch.stack((pred_x, pred_y), dim=1), best_scores
+
+
+def pck_hits(predictions: torch.Tensor, targets: torch.Tensor, threshold: float, alpha: float = 0.1) -> torch.Tensor:
+    """Return per-point PCK hits using SPair's target bounding-box threshold."""
+    if threshold <= 0:
+        raise ValueError("PCK threshold must be positive")
+    return torch.linalg.vector_norm(predictions.float() - targets.float(), dim=1) < alpha * threshold
+
+
+# Candidate utilities are retained for the separate post-parity diagnostic.
 def candidate_hit(candidates: torch.Tensor, gt_xy: Sequence[float], width: int, threshold: float) -> torch.Tensor:
-    """PCK hit for each row of flat target-map candidate indices."""
     y = torch.div(candidates, width, rounding_mode="floor").float()
     x = (candidates % width).float()
     gt = torch.tensor(gt_xy, device=candidates.device, dtype=torch.float32)
-    distance = torch.sqrt((x - gt[0]) ** 2 + (y - gt[1]) ** 2)
-    return (distance / max(float(threshold), 1e-6) <= 0.1)
-
-
-def union_hit(
-    candidates: torch.Tensor,
-    gt_xy: Sequence[float],
-    width: int,
-    threshold: float,
-    exclude_row: int | None = None,
-) -> bool:
-    """Check whether a GT point is covered by a union of candidate rows."""
-    rows = candidates if exclude_row is None else torch.cat((candidates[:exclude_row], candidates[exclude_row + 1 :]))
-    if rows.numel() == 0:
-        return False
-    return bool(candidate_hit(rows.reshape(1, -1), gt_xy, width, threshold).any().item())
+    return torch.sqrt((x - gt[0]) ** 2 + (y - gt[1]) ** 2) < 0.1 * float(threshold)
 
 
 def summarize_candidate_rows(
@@ -116,17 +163,17 @@ def summarize_candidate_rows(
     width: int,
     ks: Iterable[int],
 ) -> list[dict[str, int]]:
-    """Create per-keypoint ownership diagnostics for a candidate matrix."""
     rows: list[dict[str, int]] = []
     for point_index, gt_xy in enumerate(gt_points):
         row = {"point_index": point_index}
-        for k in ks:
-            k = min(int(k), candidates.shape[1])
+        for requested_k in ks:
+            k = min(int(requested_k), candidates.shape[1])
             local = candidates[:, :k]
-            owner_hit = bool(candidate_hit(local[point_index : point_index + 1], gt_xy, width, threshold).any().item())
-            other_hit = union_hit(local, gt_xy, width, threshold, exclude_row=point_index)
-            row[f"owner_candidate_hit@{k}"] = int(owner_hit)
-            row[f"other_source_candidate_hit@{k}"] = int(other_hit)
-            row[f"global_union_candidate_hit@{k}"] = int(owner_hit or other_hit)
+            owner = bool(candidate_hit(local[point_index : point_index + 1], gt_xy, width, threshold).any())
+            others = torch.cat((local[:point_index], local[point_index + 1 :])).reshape(1, -1)
+            other = bool(others.numel() and candidate_hit(others, gt_xy, width, threshold).any())
+            row[f"owner_candidate_hit@{requested_k}"] = int(owner)
+            row[f"other_source_candidate_hit@{requested_k}"] = int(other)
+            row[f"global_union_candidate_hit@{requested_k}"] = int(owner or other)
         rows.append(row)
     return rows

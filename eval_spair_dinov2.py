@@ -1,9 +1,8 @@
-"""Evaluate DINOv2 token features and ownership collapse on SPair-71k.
+"""Baseline-first DINOv2 nearest-neighbour evaluation on SPair-71k.
 
-The evaluator reports both the ordinary nearest-neighbour baseline and a
-label-free candidate-space diagnostic.  The diagnostic is not a method and
-must not be used to claim an accuracy improvement: it measures whether a
-correct target location survives owner-local top-M proposal truncation.
+This script intentionally contains no ownership/oracle analysis. Reproduce the
+DiTF paper's DINOv2+NN baseline first; run diagnostics only from a separate
+evaluator after baseline parity is established.
 """
 
 from __future__ import annotations
@@ -12,249 +11,296 @@ import argparse
 import csv
 import gc
 import json
-import os
-from collections import defaultdict
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
-import numpy as np
 import torch
-import torch.nn.functional as F
 from PIL import Image
 from tqdm import tqdm
-from transformers import Dinov2Model
 
-from dino_v2_spair import DINOConfig, dino_tokens_to_map, square_canvas_geometry, summarize_candidate_rows
-
-
-KS = (1, 5, 10, 20, 50)
-
-
-def image_tensor(image: Image.Image, max_side: int) -> tuple[torch.Tensor, tuple[int, int]]:
-    image = image.convert("RGB")
-    h, w = image.height, image.width
-    _, offset_x, offset_y, out_h, out_w = square_canvas_geometry(h, w, max_side)
-    image = image.resize((out_w, out_h), Image.Resampling.LANCZOS)
-    array = np.asarray(image, dtype=np.float32) / 255.0
-    # The official DINO evaluator's default resize(edge=False) embeds the
-    # resized image in a zero-valued square canvas. Keypoints are transformed
-    # to this same centered canvas below.
-    array = np.pad(
-        array,
-        ((offset_y, max_side - out_h - offset_y), (offset_x, max_side - out_w - offset_x), (0, 0)),
-        mode="constant",
-        constant_values=0.0,
-    )
-    tensor = torch.from_numpy(array).permute(2, 0, 1)
-    mean = torch.tensor((0.485, 0.456, 0.406)).view(3, 1, 1)
-    std = torch.tensor((0.229, 0.224, 0.225)).view(3, 1, 1)
-    return (tensor - mean) / std, (max_side, max_side)
+from dino_v2_spair import (
+    PAPER_DINO_ALL_IMAGE,
+    PAPER_DINO_MACRO_POINT,
+    CategoryMetrics,
+    DINOConfig,
+    cosine_nn_predictions,
+    pck_hits,
+    preprocess_square_canvas,
+    square_canvas_geometry,
+    tokens_to_patch_map,
+    transform_points_to_canvas,
+)
 
 
-class DINOv2Extractor:
-    def __init__(self, config: DINOConfig, device: str = "cuda", local_files_only: bool = False):
+class Extractor(Protocol):
+    def __call__(self, image: Image.Image) -> torch.Tensor: ...
+    def close(self) -> None: ...
+
+
+class BlockTokenExtractor:
+    """Extract pre-final-norm block tokens from an official DINOv2 ViT."""
+
+    def __init__(self, model: torch.nn.Module, config: DINOConfig, device: str, precision: str):
+        embed_dim = int(getattr(model, "embed_dim", 0))
+        blocks = getattr(model, "blocks", None)
+        patch_size = getattr(getattr(model, "patch_embed", None), "patch_size", None)
+        patch_size = patch_size[0] if isinstance(patch_size, tuple) else patch_size
+        if embed_dim != 768 or blocks is None or len(blocks) != 12 or int(patch_size or 0) != 14:
+            raise ValueError("Loaded torch.hub model is not DINOv2 ViT-B/14")
+        self.model = model.to(device).eval()
         self.config = config
         self.device = torch.device(device)
-        dtype = torch.float16 if self.device.type == "cuda" else torch.float32
-        self.model = Dinov2Model.from_pretrained(
-            config.model_name,
-            torch_dtype=dtype,
-            local_files_only=local_files_only,
-        ).to(self.device).eval()
-        self._captured: dict[str, torch.Tensor] = {}
-        self._hook = None
-        encoder_layers = getattr(getattr(self.model, "encoder", None), "layer", None)
-        if encoder_layers is not None and 0 <= config.layer < len(encoder_layers):
-            self._hook = encoder_layers[config.layer].register_forward_hook(self._capture_block)
+        self.precision = precision
+        self._tokens: torch.Tensor | None = None
+        if blocks is None or not 0 <= config.layer < len(blocks):
+            raise ValueError(f"Model does not expose DINOv2 block {config.layer}")
+        self._hook = blocks[config.layer].register_forward_hook(self._capture)
 
-    def _capture_block(self, _module: torch.nn.Module, _inputs: tuple[torch.Tensor, ...], output: Any) -> None:
-        # Dinov2EncoderLayer returns a tensor in current Transformers releases;
-        # accept a one-element tuple as well for older releases.
-        self._captured["tokens"] = output[0] if isinstance(output, (tuple, list)) else output
+    def _capture(self, _module: torch.nn.Module, _inputs: tuple[Any, ...], output: Any) -> None:
+        self._tokens = output[0] if isinstance(output, (tuple, list)) else output
 
     @torch.inference_mode()
     def __call__(self, image: Image.Image) -> torch.Tensor:
-        pixels, (height, width) = image_tensor(image, self.config.max_side)
-        model_dtype = next(self.model.parameters()).dtype
-        pixels = pixels.to(device=self.device, dtype=model_dtype)
-        output = self.model(
-            pixel_values=pixels.unsqueeze(0),
-            output_hidden_states=self._hook is None,
-            interpolate_pos_encoding=True,
-            return_dict=True,
-        )
-        if self._hook is not None:
-            tokens = self._captured.pop("tokens", None)
-            if tokens is None:
-                raise RuntimeError(f"DINO block hook did not capture layer {self.config.layer}")
-        else:
-            # HF hidden_states[0] is the embedding output; +1 maps the
-            # zero-based transformer block index to the post-block activation.
-            hidden_index = int(self.config.layer) + 1
-            if output.hidden_states is None or hidden_index >= len(output.hidden_states):
-                raise ValueError(f"DINO layer {self.config.layer} unavailable; got {len(output.hidden_states or [])} states")
-            tokens = output.hidden_states[hidden_index]
-        feature_map = dino_tokens_to_map(tokens, height, width, self.config.patch_size)[0]
-        cache_dtype = torch.float16 if self.device.type == "cuda" else torch.float32
-        return feature_map.to(dtype=cache_dtype).cpu()
+        pixels = preprocess_square_canvas(image, self.config.image_size).unsqueeze(0).to(self.device)
+        dtype = {"fp16": torch.float16, "bf16": torch.bfloat16}.get(self.precision)
+        enabled = dtype is not None and self.device.type == "cuda"
+        with torch.autocast(device_type=self.device.type, dtype=dtype, enabled=enabled):
+            self._tokens = None
+            self.model(pixels)
+        if self._tokens is None:
+            raise RuntimeError(f"DINOv2 block-{self.config.layer} hook produced no tokens")
+        feature = tokens_to_patch_map(self._tokens, self.config.grid_size)[0].float().cpu()
+        self._tokens = None
+        return feature
 
     def close(self) -> None:
-        if self._hook is not None:
-            self._hook.remove()
-            self._hook = None
+        self._hook.remove()
 
 
-def discover_pairs(dataset_path: Path, max_pairs_per_cat: int = 0) -> tuple[list[str], dict[str, list[str]], dict[str, list[str]]]:
-    test_path = dataset_path / "PairAnnotation" / "test"
-    json_list = sorted(p.name for p in test_path.glob("*.json"))
-    categories = sorted(p.name for p in (dataset_path / "JPEGImages").iterdir() if p.is_dir())
-    cat_json = {cat: [name for name in json_list if cat in name] for cat in categories}
-    cat_images: dict[str, list[str]] = {}
-    for cat in categories:
-        names: list[str] = []
-        selected_json = cat_json[cat][:max_pairs_per_cat] if max_pairs_per_cat > 0 else cat_json[cat]
-        for json_name in selected_json:
-            data = json.loads((test_path / json_name).read_text())
-            for key in ("src_imname", "trg_imname"):
-                if data[key] not in names:
-                    names.append(data[key])
-        cat_images[cat] = names
-    return categories, cat_json, cat_images
+class TransformersExtractor:
+    """HF weight-loader with the same pre-norm block-token extraction protocol."""
+
+    def __init__(self, config: DINOConfig, device: str, precision: str, local_files_only: bool):
+        try:
+            from transformers import Dinov2Model
+        except ImportError as exc:
+            raise RuntimeError("The transformers backend requires the transformers package") from exc
+        self.model = Dinov2Model.from_pretrained(
+            config.model_name,
+            local_files_only=local_files_only,
+        )
+        model_config = self.model.config
+        if (
+            int(model_config.hidden_size) != 768
+            or int(model_config.num_hidden_layers) != 12
+            or int(model_config.patch_size) != 14
+        ):
+            raise ValueError("Loaded Transformers model is not DINOv2 ViT-B/14")
+        self.config = config
+        self.device = torch.device(device)
+        self.precision = precision
+        self._tokens: torch.Tensor | None = None
+        layers = self.model.encoder.layer
+        if not 0 <= config.layer < len(layers):
+            raise ValueError(f"Model does not expose DINOv2 block {config.layer}")
+        self._hook = layers[config.layer].register_forward_hook(self._capture)
+        self.model.to(self.device).eval()
+
+    def _capture(self, _module: torch.nn.Module, _inputs: tuple[Any, ...], output: Any) -> None:
+        self._tokens = output[0] if isinstance(output, (tuple, list)) else output
+
+    @torch.inference_mode()
+    def __call__(self, image: Image.Image) -> torch.Tensor:
+        pixels = preprocess_square_canvas(image, self.config.image_size).unsqueeze(0).to(self.device)
+        dtype = {"fp16": torch.float16, "bf16": torch.bfloat16}.get(self.precision)
+        enabled = dtype is not None and self.device.type == "cuda"
+        with torch.autocast(device_type=self.device.type, dtype=dtype, enabled=enabled):
+            self._tokens = None
+            self.model(pixel_values=pixels, interpolate_pos_encoding=True, return_dict=True)
+        if self._tokens is None:
+            raise RuntimeError(f"DINOv2 block-{self.config.layer} hook produced no tokens")
+        feature = tokens_to_patch_map(self._tokens, self.config.grid_size)[0].float().cpu()
+        self._tokens = None
+        return feature
+
+    def close(self) -> None:
+        self._hook.remove()
 
 
-def load_feature(cache: Path, category: str, image_name: str) -> torch.Tensor:
-    values = torch.load(cache / f"{category}.pth", map_location="cpu")
-    return values[image_name]
+def build_extractor(args: argparse.Namespace, config: DINOConfig) -> Extractor:
+    if args.backend == "transformers":
+        return TransformersExtractor(config, args.device, args.precision, args.local_files_only)
+    source = "local" if args.model_repo else "github"
+    repo = args.model_repo or "facebookresearch/dinov2"
+    model = torch.hub.load(repo, config.hub_model, source=source, pretrained=True)
+    return BlockTokenExtractor(model, config, args.device, args.precision)
 
 
-def extract_features(args: argparse.Namespace, categories: list[str], cat_images: dict[str, list[str]]) -> None:
-    cache = Path(args.save_path)
-    cache.mkdir(parents=True, exist_ok=True)
-    if args.reuse_saved_features:
-        return
-    extractor = DINOv2Extractor(
-        DINOConfig(args.model_name, args.layer, args.patch_size, args.img_size),
-        device=args.device,
-        local_files_only=args.local_files_only,
-    )
+def discover_pairs(dataset_path: Path, max_pairs_per_cat: int) -> tuple[list[str], dict[str, list[Path]]]:
+    categories = sorted(path.name for path in (dataset_path / "JPEGImages").iterdir() if path.is_dir())
+    annotations = sorted((dataset_path / "PairAnnotation" / "test").glob("*.json"))
+    by_category = {category: [] for category in categories}
+    for annotation in annotations:
+        category = annotation.stem.rsplit(":", 1)[-1]
+        if category in by_category:
+            by_category[category].append(annotation)
+    if max_pairs_per_cat > 0:
+        by_category = {key: value[:max_pairs_per_cat] for key, value in by_category.items()}
+    return categories, by_category
+
+
+def category_image_names(pair_paths: list[Path]) -> list[str]:
+    names: set[str] = set()
+    for pair_path in pair_paths:
+        data = json.loads(pair_path.read_text(encoding="utf-8"))
+        names.update((data["src_imname"], data["trg_imname"]))
+    return sorted(names)
+
+
+def evaluate(args: argparse.Namespace, extractor: Extractor | None = None) -> dict[str, Any]:
     dataset_path = Path(args.dataset_path)
-    for cat in tqdm(categories, desc="DINOv2 features"):
-        output: dict[str, torch.Tensor] = {}
-        for image_name in tqdm(cat_images[cat], desc=cat, leave=False):
-            image = Image.open(dataset_path / "JPEGImages" / cat / image_name)
-            output[image_name] = extractor(image)
-        torch.save(output, cache / f"{cat}.pth")
-    extractor.close()
-    del extractor
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-
-
-def evaluate(args: argparse.Namespace) -> dict[str, Any]:
-    dataset_path = Path(args.dataset_path)
-    cache = Path(args.save_path)
+    config = DINOConfig(args.model_name, args.hub_model, args.layer, 14, args.image_size)
+    if (
+        config.hub_model != "dinov2_vitb14"
+        or "large" in config.model_name.lower()
+        or config.layer != 11
+        or config.image_size != 840
+    ):
+        raise ValueError("Paper parity requires DINOv2 ViT-B/14, block 11, and an 840x840 canvas")
+    categories, category_pairs = discover_pairs(dataset_path, args.max_pairs_per_cat)
+    missing_categories = [category for category in categories if not category_pairs[category]]
+    if missing_categories:
+        raise RuntimeError(f"No SPair test pairs found for categories: {missing_categories}")
+    own_extractor = extractor is None
+    extractor = extractor or build_extractor(args, config)
     device = torch.device(args.device)
-    categories, cat_json, cat_images = discover_pairs(dataset_path, args.max_pairs_per_cat)
-    extract_features(args, categories, cat_images)
-    records: list[dict[str, Any]] = []
-    per_cat_image: dict[str, list[float]] = defaultdict(list)
-    per_cat_correct: dict[str, int] = defaultdict(int)
-    per_cat_total: dict[str, int] = defaultdict(int)
-    test_path = dataset_path / "PairAnnotation" / "test"
-    for cat in categories:
-        names = torch.load(cache / f"{cat}.pth", map_location="cpu")
-        pair_names = cat_json[cat][: args.max_pairs_per_cat] if args.max_pairs_per_cat > 0 else cat_json[cat]
-        for json_name in tqdm(pair_names, desc=f"evaluate {cat}"):
-            data = json.loads((test_path / json_name).read_text())
-            # Feature caches stay on CPU; move only the current pair to the
-            # accelerator so the smoke/full evaluations do not become CPU
-            # bottlenecks while keeping disk usage bounded.
-            src = names[data["src_imname"]].to(device)
-            trg = names[data["trg_imname"]].to(device)
-            src_h, src_w = data["src_imsize"][1], data["src_imsize"][0]
-            trg_h, trg_w = data["trg_imsize"][1], data["trg_imsize"][0]
-            src_scale, src_off_x, src_off_y, _, _ = square_canvas_geometry(src_h, src_w, args.img_size)
-            trg_scale, trg_off_x, trg_off_y, _, _ = square_canvas_geometry(trg_h, trg_w, args.img_size)
-            src_up = F.interpolate(src.unsqueeze(0), size=(args.img_size, args.img_size), mode="bilinear", align_corners=False)[0]
-            trg_up = F.interpolate(trg.unsqueeze(0), size=(args.img_size, args.img_size), mode="bilinear", align_corners=False)[0]
-            src_norm = F.normalize(src_up.float(), dim=0, eps=1e-6)
-            trg_norm = F.normalize(trg_up.float(), dim=0, eps=1e-6)
-            src_points_raw = data["src_kps"]
-            trg_points_raw = data["trg_kps"]
-            src_points = [[p[0] * src_scale + src_off_x, p[1] * src_scale + src_off_y] for p in src_points_raw]
-            trg_points = [[p[0] * trg_scale + trg_off_x, p[1] * trg_scale + trg_off_y] for p in trg_points_raw]
-            vectors = torch.stack([src_norm[:, int(y), int(x)] for x, y in src_points])
-            scores = torch.einsum("nc,chw->nhw", vectors, trg_norm).flatten(1)
-            max_scores, predictions = scores.max(dim=1)
-            pred_y = torch.div(predictions, trg_w, rounding_mode="floor")
-            pred_x = predictions % trg_w
-            threshold = max(data["trg_bndbox"][3] - data["trg_bndbox"][1], data["trg_bndbox"][2] - data["trg_bndbox"][0]) * trg_scale
-            target_points = torch.tensor(trg_points, device=device, dtype=torch.float32)
-            distances = torch.sqrt((pred_x.float() - target_points[:, 0]) ** 2 + (pred_y.float() - target_points[:, 1]) ** 2)
-            baseline_hits = (distances / max(float(threshold), 1e-6) <= 0.1).tolist()
-            pair_records = []
-            max_k = min(max(KS), scores.shape[1])
-            candidates = scores.topk(max_k, dim=1).indices
-            ownership = summarize_candidate_rows(candidates, trg_points, threshold, trg_w, KS)
-            for idx, ownership_row in enumerate(ownership):
-                row = {
-                    "category": cat, "pair": json_name, "point_index": idx,
-                    "baseline_hit": int(baseline_hits[idx]), "baseline_score": float(max_scores[idx]),
-                    "source_x": src_points_raw[idx][0], "source_y": src_points_raw[idx][1],
-                    "target_x": trg_points_raw[idx][0], "target_y": trg_points_raw[idx][1],
-                    "threshold": float(threshold),
-                }
-                row.update({key: value for key, value in ownership_row.items() if key != "point_index"})
-                records.append(row)
-                per_cat_correct[cat] += int(baseline_hits[idx])
-                per_cat_total[cat] += 1
-            per_cat_image[cat].append(float(np.mean(baseline_hits)))
-    summary: dict[str, Any] = {"config": vars(args), "count": len(records), "categories": {}}
-    all_hits = [row["baseline_hit"] for row in records]
-    for cat in categories:
-        cat_rows = [row for row in records if row["category"] == cat]
-        summary["categories"][cat] = {
-            "pairs": len(per_cat_image[cat]),
-            "baseline_per_image": float(np.mean(per_cat_image[cat])) if per_cat_image[cat] else 0.0,
-            "baseline_per_point": per_cat_correct[cat] / max(per_cat_total[cat], 1),
+    metrics = {category: CategoryMetrics() for category in categories}
+    pair_records: list[dict[str, Any]] = []
+
+    try:
+        for category in categories:
+            pair_paths = category_pairs[category]
+            features: dict[str, torch.Tensor] = {}
+            image_root = dataset_path / "JPEGImages" / category
+            for image_name in tqdm(category_image_names(pair_paths), desc=f"features {category}", leave=False):
+                with Image.open(image_root / image_name) as image:
+                    features[image_name] = extractor(image)
+
+            for pair_path in tqdm(pair_paths, desc=f"evaluate {category}"):
+                data = json.loads(pair_path.read_text(encoding="utf-8"))
+                src_h, src_w = int(data["src_imsize"][1]), int(data["src_imsize"][0])
+                trg_h, trg_w = int(data["trg_imsize"][1]), int(data["trg_imsize"][0])
+                source_points = transform_points_to_canvas(data["src_kps"], src_h, src_w, config.image_size).to(device)
+                target_points = transform_points_to_canvas(data["trg_kps"], trg_h, trg_w, config.image_size).to(device)
+                predictions, _ = cosine_nn_predictions(
+                    features[data["src_imname"]].to(device),
+                    features[data["trg_imname"]].to(device),
+                    source_points,
+                    config.image_size,
+                )
+                target_scale = square_canvas_geometry(trg_h, trg_w, config.image_size)[0]
+                bbox = data["trg_bndbox"]
+                threshold = max(bbox[3] - bbox[1], bbox[2] - bbox[0]) * target_scale
+                hits = pck_hits(predictions, target_points, threshold)
+                metrics[category].update(hits)
+                pair_records.append(
+                    {
+                        "category": category,
+                        "pair": pair_path.name,
+                        "points": int(hits.numel()),
+                        "correct": int(hits.sum()),
+                        "pck@0.1": float(hits.float().mean()),
+                    }
+                )
+
+            del features
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+    finally:
+        if own_extractor:
+            extractor.close()
+
+    category_summary = {
+        category: {
+            "pairs": len(metrics[category].pair_scores),
+            "per_image_pck@0.1": metrics[category].per_image,
+            "per_point_pck@0.1": metrics[category].per_point,
+            "points": metrics[category].total,
         }
-    summary["baseline_micro_pck"] = float(np.mean(all_hits)) if all_hits else 0.0
-    summary["baseline_macro_pck"] = float(np.mean([v["baseline_per_point"] for v in summary["categories"].values()]))
-    for k in KS:
-        summary[f"owner_candidate_recall@{k}"] = float(np.mean([r[f"owner_candidate_hit@{k}"] for r in records]))
-        summary[f"other_source_transfer@{k}"] = float(np.mean([r[f"other_source_candidate_hit@{k}"] for r in records]))
-        summary[f"global_union_recall@{k}"] = float(np.mean([r[f"global_union_candidate_hit@{k}"] for r in records]))
-        failures = [r for r in records if not r["baseline_hit"]]
-        summary[f"failure_owner_candidate_recall@{k}"] = float(np.mean([r[f"owner_candidate_hit@{k}"] for r in failures])) if failures else 0.0
-        summary[f"failure_global_union_recall@{k}"] = float(np.mean([r[f"global_union_candidate_hit@{k}"] for r in failures])) if failures else 0.0
-        summary[f"failure_transferable_rate@{k}"] = float(np.mean([int(r[f"global_union_candidate_hit@{k}"] and not r[f"owner_candidate_hit@{k}"]) for r in failures])) if failures else 0.0
-    out = Path(args.output_json)
-    out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(json.dumps(summary, indent=2), encoding="utf-8")
-    with Path(args.output_csv).open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=sorted(records[0]) if records else ["category"])
-        writer.writeheader()
-        writer.writerows(records)
-    print(json.dumps(summary, indent=2))
-    print(f"Saved summary to: {out}")
-    print(f"Saved records to: {args.output_csv}")
+        for category in categories
+    }
+    all_pairs = [score for category in categories for score in metrics[category].pair_scores]
+    total_correct = sum(value.correct for value in metrics.values())
+    total_points = sum(value.total for value in metrics.values())
+    all_per_image = sum(all_pairs) / len(all_pairs) if all_pairs else 0.0
+    all_per_point = total_correct / total_points if total_points else 0.0
+    mean_per_image = sum(value.per_image for value in metrics.values()) / len(categories)
+    mean_per_point = sum(value.per_point for value in metrics.values()) / len(categories)
+    is_full = args.max_pairs_per_cat == 0
+    parity_evaluated = is_full and args.precision == "fp32"
+    summary: dict[str, Any] = {
+        "protocol": {
+            "reference": "GeoAware-SC / DiTF DINOv2+NN",
+            "model": "dinov2_vitb14",
+            "input": "840x840 aspect-preserving zero canvas",
+            "descriptor": "block 11 token facet, pre-final-norm, 60x60",
+            "matcher": "cosine nearest neighbour on patch centers",
+            "feature_cache": "category-scoped memory only",
+            "diagnostics_enabled": False,
+        },
+        "config": vars(args),
+        "categories": category_summary,
+        "all_per_image_pck@0.1": all_per_image,
+        "all_per_point_pck@0.1": all_per_point,
+        "mean_per_image_pck@0.1": mean_per_image,
+        "mean_per_point_pck@0.1": mean_per_point,
+        "paper_targets": {
+            "all_per_image_pck@0.1": PAPER_DINO_ALL_IMAGE,
+            "mean_per_point_pck@0.1": PAPER_DINO_MACRO_POINT,
+        },
+        "full_run_parity": None if not parity_evaluated else {
+            "all_per_image_delta": all_per_image - PAPER_DINO_ALL_IMAGE,
+            "mean_per_point_delta": mean_per_point - PAPER_DINO_MACRO_POINT,
+            "within_1_point": abs(all_per_image - PAPER_DINO_ALL_IMAGE) <= 0.01
+            and abs(mean_per_point - PAPER_DINO_MACRO_POINT) <= 0.01,
+        },
+    }
+    output_json = Path(args.output_json)
+    output_json.parent.mkdir(parents=True, exist_ok=True)
+    output_json.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    if args.output_csv:
+        output_csv = Path(args.output_csv)
+        output_csv.parent.mkdir(parents=True, exist_ok=True)
+        with output_csv.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=("category", "pair", "points", "correct", "pck@0.1"))
+            writer.writeheader()
+            writer.writerows(pair_records)
+
+    for category, values in category_summary.items():
+        print(f"{category} per point PCK@0.1: {100 * values['per_point_pck@0.1']:.2f}")
+    print(f"All per image PCK@0.1: {100 * all_per_image:.2f}")
+    print(f"All per point PCK@0.1: {100 * all_per_point:.2f}")
+    print(f"Mean per image PCK@0.1: {100 * mean_per_image:.2f}")
+    print(f"Mean per point PCK@0.1: {100 * mean_per_point:.2f}")
+    print(f"Saved baseline summary to: {output_json}")
     return summary
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dataset_path", required=True)
-    parser.add_argument("--save_path", required=True)
     parser.add_argument("--output_json", required=True)
-    parser.add_argument("--output_csv", required=True)
-    parser.add_argument("--model_name", default="facebook/dinov2-large")
+    parser.add_argument("--output_csv", default=None, help="Optional per-pair output; disabled by default")
+    parser.add_argument("--backend", choices=("transformers", "torch_hub"), default="transformers")
+    parser.add_argument("--model_name", default="facebook/dinov2-base")
+    parser.add_argument("--hub_model", default="dinov2_vitb14")
+    parser.add_argument("--model_repo", default=None, help="Local official DINOv2 repo for torch_hub backend")
     parser.add_argument("--layer", type=int, default=11)
-    parser.add_argument("--patch_size", type=int, default=14)
-    parser.add_argument("--img_size", type=int, default=840)
+    parser.add_argument("--image_size", type=int, default=840)
     parser.add_argument("--device", default="cuda")
+    parser.add_argument("--precision", choices=("fp32", "fp16", "bf16"), default="fp32")
     parser.add_argument("--local_files_only", action="store_true")
-    parser.add_argument("--reuse_saved_features", action="store_true")
     parser.add_argument("--max_pairs_per_cat", type=int, default=0)
     return parser
 
