@@ -16,7 +16,7 @@ import torch.nn.functional as F
 from PIL import Image
 
 
-PAPER_DINO_MACRO_POINT = 0.556
+PAPER_DINO_ALL_POINT = 0.556
 PAPER_DINO_ALL_IMAGE = 0.539
 
 
@@ -125,6 +125,19 @@ def cosine_nn_predictions(
     image_size: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Match source keypoints to target patch centers with cosine NN."""
+    scores = cosine_similarity_scores(source_map, target_map, source_points, image_size)
+    best_scores, target_indices = scores.max(dim=1)
+    predictions = patch_indices_to_points(target_indices, target_map.shape[-1], image_size / target_map.shape[-1])
+    return predictions, best_scores
+
+
+def cosine_similarity_scores(
+    source_map: torch.Tensor,
+    target_map: torch.Tensor,
+    source_points: torch.Tensor,
+    image_size: int,
+) -> torch.Tensor:
+    """Return source-keypoint to all-target-patch cosine similarities."""
     if source_map.shape != target_map.shape or source_map.ndim != 3:
         raise ValueError("source and target maps must have identical CxHxW shapes")
     _, grid_h, grid_w = source_map.shape
@@ -133,12 +146,14 @@ def cosine_nn_predictions(
     source = F.normalize(source_map.float().flatten(1).transpose(0, 1), dim=1, eps=1e-10)
     target = F.normalize(target_map.float().flatten(1).transpose(0, 1), dim=1, eps=1e-10)
     source_indices = points_to_patch_indices(source_points, image_size, grid_h).to(source.device)
-    scores = source[source_indices] @ target.transpose(0, 1)
-    best_scores, target_indices = scores.max(dim=1)
-    stride = image_size / grid_h
-    pred_x = (target_indices % grid_w).float() * stride + stride / 2
-    pred_y = torch.div(target_indices, grid_w, rounding_mode="floor").float() * stride + stride / 2
-    return torch.stack((pred_x, pred_y), dim=1), best_scores
+    return source[source_indices] @ target.transpose(0, 1)
+
+
+def patch_indices_to_points(indices: torch.Tensor, grid_width: int, stride: float) -> torch.Tensor:
+    """Decode flattened patch indices as canvas-space patch centers."""
+    x = (indices % grid_width).float() * stride + stride / 2
+    y = torch.div(indices, grid_width, rounding_mode="floor").float() * stride + stride / 2
+    return torch.stack((x, y), dim=-1)
 
 
 def pck_hits(predictions: torch.Tensor, targets: torch.Tensor, threshold: float, alpha: float = 0.1) -> torch.Tensor:
@@ -149,11 +164,16 @@ def pck_hits(predictions: torch.Tensor, targets: torch.Tensor, threshold: float,
 
 
 # Candidate utilities are retained for the separate post-parity diagnostic.
-def candidate_hit(candidates: torch.Tensor, gt_xy: Sequence[float], width: int, threshold: float) -> torch.Tensor:
-    y = torch.div(candidates, width, rounding_mode="floor").float()
-    x = (candidates % width).float()
+def candidate_hit(
+    candidates: torch.Tensor,
+    gt_xy: Sequence[float],
+    width: int,
+    threshold: float,
+    patch_stride: float = 1.0,
+) -> torch.Tensor:
+    points = patch_indices_to_points(candidates, width, patch_stride)
     gt = torch.tensor(gt_xy, device=candidates.device, dtype=torch.float32)
-    return torch.sqrt((x - gt[0]) ** 2 + (y - gt[1]) ** 2) < 0.1 * float(threshold)
+    return torch.linalg.vector_norm(points - gt, dim=-1) < 0.1 * float(threshold)
 
 
 def summarize_candidate_rows(
@@ -162,6 +182,7 @@ def summarize_candidate_rows(
     threshold: float,
     width: int,
     ks: Iterable[int],
+    patch_stride: float = 1.0,
 ) -> list[dict[str, int]]:
     rows: list[dict[str, int]] = []
     for point_index, gt_xy in enumerate(gt_points):
@@ -169,9 +190,13 @@ def summarize_candidate_rows(
         for requested_k in ks:
             k = min(int(requested_k), candidates.shape[1])
             local = candidates[:, :k]
-            owner = bool(candidate_hit(local[point_index : point_index + 1], gt_xy, width, threshold).any())
+            owner = bool(
+                candidate_hit(local[point_index : point_index + 1], gt_xy, width, threshold, patch_stride).any()
+            )
             others = torch.cat((local[:point_index], local[point_index + 1 :])).reshape(1, -1)
-            other = bool(others.numel() and candidate_hit(others, gt_xy, width, threshold).any())
+            other = bool(
+                others.numel() and candidate_hit(others, gt_xy, width, threshold, patch_stride).any()
+            )
             row[f"owner_candidate_hit@{requested_k}"] = int(owner)
             row[f"other_source_candidate_hit@{requested_k}"] = int(other)
             row[f"global_union_candidate_hit@{requested_k}"] = int(owner or other)

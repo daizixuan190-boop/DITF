@@ -20,7 +20,7 @@ from tqdm import tqdm
 
 from dino_v2_spair import (
     PAPER_DINO_ALL_IMAGE,
-    PAPER_DINO_MACRO_POINT,
+    PAPER_DINO_ALL_POINT,
     CategoryMetrics,
     DINOConfig,
     cosine_nn_predictions,
@@ -257,13 +257,13 @@ def evaluate(args: argparse.Namespace, extractor: Extractor | None = None) -> di
         "mean_per_point_pck@0.1": mean_per_point,
         "paper_targets": {
             "all_per_image_pck@0.1": PAPER_DINO_ALL_IMAGE,
-            "mean_per_point_pck@0.1": PAPER_DINO_MACRO_POINT,
+            "all_per_point_pck@0.1": PAPER_DINO_ALL_POINT,
         },
         "full_run_parity": None if not parity_evaluated else {
             "all_per_image_delta": all_per_image - PAPER_DINO_ALL_IMAGE,
-            "mean_per_point_delta": mean_per_point - PAPER_DINO_MACRO_POINT,
+            "all_per_point_delta": all_per_point - PAPER_DINO_ALL_POINT,
             "within_1_point": abs(all_per_image - PAPER_DINO_ALL_IMAGE) <= 0.01
-            and abs(mean_per_point - PAPER_DINO_MACRO_POINT) <= 0.01,
+            and abs(all_per_point - PAPER_DINO_ALL_POINT) <= 0.01,
         },
     }
     output_json = Path(args.output_json)

@@ -3,6 +3,7 @@ from PIL import Image
 
 from dino_v2_spair import (
     CategoryMetrics,
+    candidate_hit,
     cosine_nn_predictions,
     pck_hits,
     preprocess_square_canvas,
@@ -49,3 +50,9 @@ def test_category_metrics_distinguishes_per_image_and_per_point():
     metrics.update(torch.tensor([False, False, True]))
     assert metrics.per_image == 2 / 3
     assert metrics.per_point == 0.5
+
+
+def test_candidate_hit_uses_patch_centers_in_canvas_units():
+    candidates = torch.tensor([[3]])
+    # Flat index 3 in a 2-wide grid is centered at (21, 21) for stride 14.
+    assert candidate_hit(candidates, [21, 21], width=2, threshold=10, patch_stride=14).item()
