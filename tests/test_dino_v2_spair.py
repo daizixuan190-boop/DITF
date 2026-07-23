@@ -1,12 +1,18 @@
 import torch
 
-from dino_v2_spair import candidate_hit, dino_tokens_to_map, resize_shape, summarize_candidate_rows
+from dino_v2_spair import candidate_hit, dino_tokens_to_map, resize_shape, square_canvas_geometry, summarize_candidate_rows
 
 
 def test_resize_is_aspect_preserving_and_patch_aligned():
     height, width = resize_shape(300, 500, 840)
-    assert height == 840
-    assert width > 840
+    assert (height, width) == (504, 840)
+
+
+def test_square_canvas_geometry_matches_spair_coordinate_transform():
+    scale, offset_x, offset_y, resized_h, resized_w = square_canvas_geometry(300, 500, 840)
+    assert (resized_h, resized_w) == (504, 840)
+    assert (offset_x, offset_y) == (0, 168)
+    assert scale == 840 / 500
     assert height % 14 == 0 and width % 14 == 0
 
 

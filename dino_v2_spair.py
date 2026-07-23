@@ -24,18 +24,25 @@ class DINOConfig:
 
 
 def resize_shape(height: int, width: int, max_side: int, patch_size: int = 14) -> tuple[int, int]:
-    """Match the official ViTExtractor ``Resize(int)`` preprocessing.
-
-    An integer torchvision resize sets the *shorter* side to the requested
-    size, preserves aspect ratio, and the extractor then floors both sides to
-    patch-size multiples.  This is deliberately not a longest-side resize.
-    """
-    scale = float(max_side) / min(height, width)
+    """Return the resized content shape before square-canvas padding."""
+    scale = float(max_side) / max(height, width)
     resized_h = max(1, int(round(height * scale)))
     resized_w = max(1, int(round(width * scale)))
     out_h = max(patch_size, (resized_h // patch_size) * patch_size)
     out_w = max(patch_size, (resized_w // patch_size) * patch_size)
     return out_h, out_w
+
+
+def square_canvas_geometry(
+    height: int, width: int, target_res: int
+) -> tuple[float, int, int, int, int]:
+    """Return scale, offsets, and resized content shape for official DINO input."""
+    scale = float(target_res) / max(height, width)
+    resized_h = max(1, int(round(height * scale)))
+    resized_w = max(1, int(round(width * scale)))
+    offset_y = (target_res - resized_h) // 2
+    offset_x = (target_res - resized_w) // 2
+    return scale, offset_x, offset_y, resized_h, resized_w
 
 
 def dino_tokens_to_map(tokens: torch.Tensor, height: int, width: int, patch_size: int = 14) -> torch.Tensor:

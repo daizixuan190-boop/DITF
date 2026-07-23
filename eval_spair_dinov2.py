@@ -24,7 +24,7 @@ from PIL import Image
 from tqdm import tqdm
 from transformers import Dinov2Model
 
-from dino_v2_spair import DINOConfig, dino_tokens_to_map, resize_shape, summarize_candidate_rows
+from dino_v2_spair import DINOConfig, dino_tokens_to_map, square_canvas_geometry, summarize_candidate_rows
 
 
 KS = (1, 5, 10, 20, 50)
@@ -33,13 +33,20 @@ KS = (1, 5, 10, 20, 50)
 def image_tensor(image: Image.Image, max_side: int) -> tuple[torch.Tensor, tuple[int, int]]:
     image = image.convert("RGB")
     h, w = image.height, image.width
-    out_h, out_w = resize_shape(h, w, max_side)
+    _, offset_x, offset_y, out_h, out_w = square_canvas_geometry(h, w, max_side)
     image = image.resize((out_w, out_h), Image.Resampling.LANCZOS)
     array = np.asarray(image, dtype=np.float32) / 255.0
+    # The official DINO evaluator embeds the resized image in a square canvas
+    # using edge padding. Keypoints are transformed to this same canvas below.
+    array = np.pad(
+        array,
+        ((offset_y, max_side - out_h - offset_y), (offset_x, max_side - out_w - offset_x), (0, 0)),
+        mode="edge",
+    )
     tensor = torch.from_numpy(array).permute(2, 0, 1)
     mean = torch.tensor((0.485, 0.456, 0.406)).view(3, 1, 1)
     std = torch.tensor((0.229, 0.224, 0.225)).view(3, 1, 1)
-    return (tensor - mean) / std, (out_h, out_w)
+    return (tensor - mean) / std, (max_side, max_side)
 
 
 class DINOv2Extractor:
@@ -165,18 +172,22 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
             trg = names[data["trg_imname"]].to(device)
             src_h, src_w = data["src_imsize"][1], data["src_imsize"][0]
             trg_h, trg_w = data["trg_imsize"][1], data["trg_imsize"][0]
-            src_up = F.interpolate(src.unsqueeze(0), size=(src_h, src_w), mode="bilinear", align_corners=False)[0]
-            trg_up = F.interpolate(trg.unsqueeze(0), size=(trg_h, trg_w), mode="bilinear", align_corners=False)[0]
+            src_scale, src_off_x, src_off_y, _, _ = square_canvas_geometry(src_h, src_w, args.img_size)
+            trg_scale, trg_off_x, trg_off_y, _, _ = square_canvas_geometry(trg_h, trg_w, args.img_size)
+            src_up = F.interpolate(src.unsqueeze(0), size=(args.img_size, args.img_size), mode="bilinear", align_corners=False)[0]
+            trg_up = F.interpolate(trg.unsqueeze(0), size=(args.img_size, args.img_size), mode="bilinear", align_corners=False)[0]
             src_norm = F.normalize(src_up.float(), dim=0, eps=1e-6)
             trg_norm = F.normalize(trg_up.float(), dim=0, eps=1e-6)
-            src_points = data["src_kps"]
-            trg_points = data["trg_kps"]
+            src_points_raw = data["src_kps"]
+            trg_points_raw = data["trg_kps"]
+            src_points = [[p[0] * src_scale + src_off_x, p[1] * src_scale + src_off_y] for p in src_points_raw]
+            trg_points = [[p[0] * trg_scale + trg_off_x, p[1] * trg_scale + trg_off_y] for p in trg_points_raw]
             vectors = torch.stack([src_norm[:, int(y), int(x)] for x, y in src_points])
             scores = torch.einsum("nc,chw->nhw", vectors, trg_norm).flatten(1)
             max_scores, predictions = scores.max(dim=1)
             pred_y = torch.div(predictions, trg_w, rounding_mode="floor")
             pred_x = predictions % trg_w
-            threshold = max(data["trg_bndbox"][3] - data["trg_bndbox"][1], data["trg_bndbox"][2] - data["trg_bndbox"][0])
+            threshold = max(data["trg_bndbox"][3] - data["trg_bndbox"][1], data["trg_bndbox"][2] - data["trg_bndbox"][0]) * trg_scale
             target_points = torch.tensor(trg_points, device=device, dtype=torch.float32)
             distances = torch.sqrt((pred_x.float() - target_points[:, 0]) ** 2 + (pred_y.float() - target_points[:, 1]) ** 2)
             baseline_hits = (distances / max(float(threshold), 1e-6) <= 0.1).tolist()
@@ -188,8 +199,8 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
                 row = {
                     "category": cat, "pair": json_name, "point_index": idx,
                     "baseline_hit": int(baseline_hits[idx]), "baseline_score": float(max_scores[idx]),
-                    "source_x": src_points[idx][0], "source_y": src_points[idx][1],
-                    "target_x": trg_points[idx][0], "target_y": trg_points[idx][1],
+                    "source_x": src_points_raw[idx][0], "source_y": src_points_raw[idx][1],
+                    "target_x": trg_points_raw[idx][0], "target_y": trg_points_raw[idx][1],
                     "threshold": float(threshold),
                 }
                 row.update({key: value for key, value in ownership_row.items() if key != "point_index"})
