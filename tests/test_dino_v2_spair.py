@@ -90,3 +90,17 @@ def test_controlled_candidates_reject_other_gt_overlap():
     rows = controlled_candidate_rows(scores, gt_points, threshold=20, width=2, ks=[1], patch_stride=10)
     assert rows[0]["other_source_candidate_hit@1"] == 1
     assert rows[0]["strict_other_source_candidate_hit@1"] == 0
+
+
+def test_controlled_candidates_preserve_baseline_argmax_under_ties():
+    scores = torch.ones(1, 4)
+    rows = controlled_candidate_rows(
+        scores,
+        torch.tensor([[5.0, 5.0]]),
+        threshold=10,
+        width=2,
+        ks=[1],
+        patch_stride=10,
+        baseline_indices=torch.tensor([0]),
+    )
+    assert rows[0]["owner_candidate_hit@1"] == 1

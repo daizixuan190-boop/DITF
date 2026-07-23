@@ -229,6 +229,7 @@ def controlled_candidate_rows(
     width: int,
     ks: Iterable[int],
     patch_stride: float,
+    baseline_indices: torch.Tensor | None = None,
 ) -> list[dict[str, int | float]]:
     """Compute ownership diagnostics with overlap, budget and random controls.
 
@@ -246,6 +247,22 @@ def controlled_candidate_rows(
     num_sources, population = scores.shape
     max_rank = min(max(ks) * num_sources, population)
     ranked = scores.topk(max_rank, dim=1).indices
+    if baseline_indices is not None:
+        baseline_indices = baseline_indices.to(device=scores.device, dtype=torch.long).flatten()
+        if baseline_indices.shape[0] != num_sources:
+            raise ValueError("baseline_indices must contain one index per source point")
+        ranked = ranked.clone()
+        for source_index, baseline_index in enumerate(baseline_indices):
+            matches = torch.nonzero(ranked[source_index] == baseline_index, as_tuple=False).flatten()
+            if matches.numel():
+                match_index = int(matches[0])
+                ranked[source_index, 0], ranked[source_index, match_index] = (
+                    ranked[source_index, match_index].clone(),
+                    ranked[source_index, 0].clone(),
+                )
+            else:
+                ranked[source_index, 1:] = ranked[source_index, :-1].clone()
+                ranked[source_index, 0] = baseline_index
     all_indices = torch.arange(population, device=scores.device)
     all_points = patch_indices_to_points(all_indices, width, patch_stride)
     gt_points = gt_points.to(device=scores.device, dtype=torch.float32)

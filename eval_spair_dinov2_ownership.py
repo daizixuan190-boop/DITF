@@ -181,7 +181,8 @@ def evaluate(args: argparse.Namespace, extractor: Extractor | None = None) -> di
                     840,
                 )
                 stride = 14.0
-                predictions = patch_indices_to_points(scores.argmax(dim=1), 60, stride)
+                baseline_indices = scores.argmax(dim=1)
+                predictions = patch_indices_to_points(baseline_indices, 60, stride)
                 bbox = data["trg_bndbox"]
                 threshold = max(bbox[3] - bbox[1], bbox[2] - bbox[0]) * square_canvas_geometry(
                     trg_h, trg_w, 840
@@ -195,6 +196,7 @@ def evaluate(args: argparse.Namespace, extractor: Extractor | None = None) -> di
                     60,
                     ks,
                     stride,
+                    baseline_indices.detach().cpu(),
                 )
                 update_counts(total_counts, rows, hits, ks)
                 update_counts(category_counts[category], rows, hits, ks)
@@ -205,6 +207,14 @@ def evaluate(args: argparse.Namespace, extractor: Extractor | None = None) -> di
                              "baseline_hit": int(hit), **{key: value for key, value in row.items() if key != "point_index"}}
                         )
 
+            if 1 in ks:
+                category_ratio = ratios(category_counts[category], ks)["1"]
+                if abs(category_ratio["owner_candidate_recall"] - baseline[category].per_point) >= 1e-12:
+                    raise RuntimeError(
+                        f"K=1 baseline parity failed early for category {category}: "
+                        f"owner={category_ratio['owner_candidate_recall']}, "
+                        f"baseline={baseline[category].per_point}"
+                    )
             del features
             gc.collect()
             if torch.cuda.is_available():
