@@ -145,6 +145,7 @@ def extract_features(args: argparse.Namespace, categories: list[str], cat_images
 def evaluate(args: argparse.Namespace) -> dict[str, Any]:
     dataset_path = Path(args.dataset_path)
     cache = Path(args.save_path)
+    device = torch.device(args.device)
     categories, cat_json, cat_images = discover_pairs(dataset_path, args.max_pairs_per_cat)
     extract_features(args, categories, cat_images)
     records: list[dict[str, Any]] = []
@@ -157,8 +158,11 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
         pair_names = cat_json[cat][: args.max_pairs_per_cat] if args.max_pairs_per_cat > 0 else cat_json[cat]
         for json_name in tqdm(pair_names, desc=f"evaluate {cat}"):
             data = json.loads((test_path / json_name).read_text())
-            src = names[data["src_imname"]]
-            trg = names[data["trg_imname"]]
+            # Feature caches stay on CPU; move only the current pair to the
+            # accelerator so the smoke/full evaluations do not become CPU
+            # bottlenecks while keeping disk usage bounded.
+            src = names[data["src_imname"]].to(device)
+            trg = names[data["trg_imname"]].to(device)
             src_h, src_w = data["src_imsize"][1], data["src_imsize"][0]
             trg_h, trg_w = data["trg_imsize"][1], data["trg_imsize"][0]
             src_up = F.interpolate(src.unsqueeze(0), size=(src_h, src_w), mode="bilinear", align_corners=False)[0]
@@ -173,7 +177,8 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
             pred_y = torch.div(predictions, trg_w, rounding_mode="floor")
             pred_x = predictions % trg_w
             threshold = max(data["trg_bndbox"][3] - data["trg_bndbox"][1], data["trg_bndbox"][2] - data["trg_bndbox"][0])
-            distances = torch.sqrt((pred_x.float() - torch.tensor([p[0] for p in trg_points])) ** 2 + (pred_y.float() - torch.tensor([p[1] for p in trg_points])) ** 2)
+            target_points = torch.tensor(trg_points, device=device, dtype=torch.float32)
+            distances = torch.sqrt((pred_x.float() - target_points[:, 0]) ** 2 + (pred_y.float() - target_points[:, 1]) ** 2)
             baseline_hits = (distances / max(float(threshold), 1e-6) <= 0.1).tolist()
             pair_records = []
             max_k = min(max(KS), scores.shape[1])
