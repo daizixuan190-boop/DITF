@@ -288,3 +288,28 @@ repeated unchanged on heldout20.  If it fails to give a stable held-out rank
 lift in that residual, RoMa's presently accessible internal representation is
 not evidence for another injection or distillation project and that route is
 closed rather than tuned.
+
+#### Result: rejected at the fixed 18-pair interface gate
+
+The first pair from each of the 18 SPair categories was used only as an
+interface and mechanism gate (150 annotated source points; 26
+`both_wrong_top20_hit` points).  It used the exact previously saved
+discovery20 attention candidate pool, so the historical RoMa warp audit can
+be aligned point-for-point without rerunning FLUX.
+
+| Fixed 18-pair subset | All 150 top-1 PCK | Both-wrong 26 top-1 PCK |
+|---|---:|---:|
+| Native DiTF baseline | 72.00 | 0.00 |
+| Attention top-1 | 64.67 | 0.00 |
+| Final RoMa bidirectional warp | 60.67 | 38.46 |
+| RoMa encoder cosine control | 69.33 | 42.31 |
+| RoMa pre-warp GP coordinate agreement | 68.67 | 30.77 |
+
+The pre-warp GP score is below the non-pair-conditioned encoder control on
+the full subset (`68.67 < 69.33`) and loses three of 26 hard residual points
+to the existing final-warp rule (`30.77 < 38.46`).  The encoder control's
+one-point hard residual advantage over final warp is insufficient evidence
+for a new pair-conditioned identity mechanism and is still below native
+baseline overall.  This fails the pre-registered gate; do not run full
+discovery20 or heldout20 for GP posterior ranking, and do not turn it into a
+feature injection or distillation target by tuning its score.
