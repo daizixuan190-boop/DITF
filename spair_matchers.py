@@ -11756,8 +11756,16 @@ def flux_fjsar_candidate_feature_batch(
     use_coordinate_bias: bool = False,
     candidate_topk: int = 20,
     include_identity_token_sketches: bool = False,
+    extra_candidate_pixels: torch.Tensor | None = None,
 ) -> dict[str, Any]:
-    """Build annotation-free features for fixed mutual-attention candidates."""
+    """Build annotation-free features for fixed mutual-attention candidates.
+
+    ``extra_candidate_pixels`` optionally appends externally proposed target
+    pixels after the attention top-k.  It is deliberately candidate-only: no
+    target correspondence or correctness label enters feature construction.
+    The supervised capacity diagnostic uses this to retain the frozen DiTF
+    top-1 prediction as one explicit fallback candidate.
+    """
 
     points = list(source_points)
     if not points:
@@ -11799,8 +11807,9 @@ def flux_fjsar_candidate_feature_batch(
             max(1, int(candidate_topk)),
             int(mutual_attention.shape[1]),
         )
+        query_attention = mutual_attention.index_select(0, src_cells)
         attention_values, candidate_cells = torch.topk(
-            mutual_attention.index_select(0, src_cells),
+            query_attention,
             k=candidate_count,
             dim=1,
             sorted=True,
@@ -11820,6 +11829,41 @@ def flux_fjsar_candidate_feature_batch(
             (cell_y + 0.5) * float(target_h) / float(trg_state.image_height) - 0.5
         ).long().clamp_(0, target_h - 1)
         proposal_pixels = proposal_y * target_w + proposal_x
+
+        attention_candidate_count = int(candidate_count)
+        extra_candidate_count = 0
+        if extra_candidate_pixels is not None:
+            if not isinstance(extra_candidate_pixels, torch.Tensor):
+                raise TypeError("extra_candidate_pixels must be a tensor")
+            if extra_candidate_pixels.ndim != 2 or int(extra_candidate_pixels.shape[0]) != len(points):
+                raise ValueError("extra_candidate_pixels must be [point_count, extra_count]")
+            extra_candidate_count = int(extra_candidate_pixels.shape[1])
+            if extra_candidate_count < 1:
+                raise ValueError("extra_candidate_pixels must contain at least one candidate")
+            extra_pixels = extra_candidate_pixels.to(
+                device=proposal_pixels.device,
+                dtype=torch.long,
+            ).clamp(0, target_h * target_w - 1)
+            extra_x = extra_pixels % target_w
+            extra_y = torch.div(extra_pixels, target_w, rounding_mode="floor")
+            extra_cell_x = torch.floor(
+                (extra_x.float() + 0.5)
+                * float(trg_state.image_width)
+                / float(target_w)
+            ).long().clamp_(0, int(trg_state.image_width) - 1)
+            extra_cell_y = torch.floor(
+                (extra_y.float() + 0.5)
+                * float(trg_state.image_height)
+                / float(target_h)
+            ).long().clamp_(0, int(trg_state.image_height) - 1)
+            extra_cells = extra_cell_y * int(trg_state.image_width) + extra_cell_x
+            extra_attention = query_attention.gather(1, extra_cells)
+            candidate_cells = torch.cat((candidate_cells, extra_cells), dim=1)
+            proposal_pixels = torch.cat((proposal_pixels, extra_pixels), dim=1)
+            proposal_x = torch.cat((proposal_x, extra_x), dim=1)
+            proposal_y = torch.cat((proposal_y, extra_y), dim=1)
+            attention_values = torch.cat((attention_values, extra_attention), dim=1)
+        candidate_count = int(candidate_cells.shape[1])
 
         internal = flux_candidate_internal_state_probe(
             blocks,
@@ -11843,10 +11887,11 @@ def flux_fjsar_candidate_feature_batch(
         matches = proposal_pixels.unsqueeze(2) == native_sorted_pixels.unsqueeze(1)
         if not bool(matches.any(dim=2).all()):
             raise RuntimeError("native control scores lost an attention candidate")
-        native_scores = (
-            matches.to(native_sorted_scores.dtype)
-            * native_sorted_scores.unsqueeze(1)
-        ).sum(dim=2)
+        # Candidate sets may intentionally contain duplicate pixels (for
+        # example, when baseline top-1 is already attention rank zero).  Pick
+        # one matching score instead of summing all duplicate occurrences.
+        match_positions = matches.to(torch.int64).argmax(dim=2)
+        native_scores = native_sorted_scores.gather(1, match_positions)
 
         source_xy = torch.tensor(points, device=proposal_x.device, dtype=torch.float32)
         source_x = source_xy[:, 0].clamp(0, int(source_size[1]) - 1)
@@ -11855,12 +11900,23 @@ def flux_fjsar_candidate_feature_batch(
         source_y_norm = source_y / float(max(1, int(source_size[0]) - 1))
         target_x_norm = proposal_x.float() / float(max(1, target_w - 1))
         target_y_norm = proposal_y.float() / float(max(1, target_h - 1))
-        candidate_rank = torch.arange(
-            candidate_count,
+        attention_rank = torch.arange(
+            attention_candidate_count,
             device=proposal_x.device,
             dtype=torch.float32,
         ).reshape(1, -1).expand(len(points), -1)
-        candidate_rank = candidate_rank / float(max(1, candidate_count - 1))
+        attention_rank = attention_rank / float(max(1, attention_candidate_count - 1))
+        if extra_candidate_count:
+            candidate_rank = torch.cat((
+                attention_rank,
+                torch.ones(
+                    (len(points), extra_candidate_count),
+                    device=proposal_x.device,
+                    dtype=torch.float32,
+                ),
+            ), dim=1)
+        else:
+            candidate_rank = attention_rank
         proposal_attention = torch.stack(
             (
                 attention_values,
@@ -11869,6 +11925,23 @@ def flux_fjsar_candidate_feature_batch(
             ),
             dim=2,
         )
+        if extra_candidate_count:
+            is_extra = torch.cat((
+                torch.zeros(
+                    (len(points), attention_candidate_count),
+                    device=proposal_x.device,
+                    dtype=torch.float32,
+                ),
+                torch.ones(
+                    (len(points), extra_candidate_count),
+                    device=proposal_x.device,
+                    dtype=torch.float32,
+                ),
+            ), dim=1)
+            proposal_attention = torch.cat(
+                (proposal_attention, is_extra.unsqueeze(2)),
+                dim=2,
+            )
         geometry = torch.stack(
             (
                 source_x_norm[:, None].expand(-1, candidate_count),
@@ -11895,7 +11968,7 @@ def flux_fjsar_candidate_feature_batch(
             "mutual_attention",
             "log_mutual_attention",
             "attention_rank_normalized",
-        ],
+        ] + (["is_extra_candidate"] if extra_candidate_count else []),
         "native_control": ["official_ditf_cosine_within_attention_candidates"],
         "geometry_control": [
             "source_x_normalized",
@@ -11918,6 +11991,8 @@ def flux_fjsar_candidate_feature_batch(
             **internal["metadata"],
             "point_count": int(len(points)),
             "candidate_count": int(candidate_count),
+            "attention_candidate_count": int(attention_candidate_count),
+            "extra_candidate_count": int(extra_candidate_count),
             "source_size": [int(value) for value in source_size],
             "target_size": [int(value) for value in target_size],
             "gt_used_for_features": False,
