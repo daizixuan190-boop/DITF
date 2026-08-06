@@ -79,6 +79,16 @@ feature failures, another annotated semantic part already outranks the GT
 part under center similarity; enlarging local context to radius 4 improves
 the mean margin by only 0.00194.
 
+The directly relevant `local_relational_identity_audit` is already available
+and is also negative.  It compares source and candidate FLUX token patches,
+local self-similarity, and attention-row differentials.  In its 459
+oracle-gap points, its best hand-designed hybrid selects a PCK-valid proposal
+at top-1 only 90 times (19.61%, median rank 6).  Native patch correlation is
+98/459 (21.35%, median rank 5).  These patch relations are therefore not
+absent from the current audit; the tested scalar reductions of them are too
+weak.  Dense graph belief and partial assignment are likewise below raw
+attention top-1 and far below the native baseline.
+
 ### Independent correspondence encoders do rank candidates, but cannot route safely
 
 On the same 2,663-point discovery20 candidate pool:
@@ -93,6 +103,11 @@ For the harder `both_wrong_top20_hit` cohort (493 points), RoMa top-1 is
 18.40%.  Therefore both contain genuine pair-conditioned candidate identity
 evidence.  Their top-1 output is nevertheless below native DiTF because
 neither score knows when the native prediction is already correct.
+
+The RoMa effect is stable, not a discovery-only coincidence: its heldout20
+top-1 is 60.19% overall and 36.70% on 515 both-wrong top-20-hit points.  A
+multiview RoMa rank consensus does not improve discovery top-1 (59.03% versus
+59.37% for the single-view score), so more rank averaging is rejected too.
 
 This is evidence for two separate requirements:
 
@@ -150,6 +165,31 @@ topological scalar features is the missing representation.  The artifact does
 not preserve branch-level candidate values for a new retrospective separation
 test, so no claim should be made about which individual hand-crafted term is
 at fault.
+
+### Follow-up OOF upper bound: existing candidate scalars cannot safely combine RoMa
+
+`analyze_candidate_identity_upper_bound.py` was extended only to normalize the
+saved RoMa/DINO pair-record layout, then run as a pair-grouped, three-fold OOF
+*supervised upper-bound* audit.  This is intentionally more favorable than a
+label-free method: a gradient-boosted classifier sees the candidate-level
+FLUX, RoMa, and optionally DINO scalar evidence and PCK only as offline
+training labels.
+
+The base candidate dump uses a nearby attention-isometry protocol, so its
+baseline is 69.10 rather than the 68.76 protocol used by the certified-anchor
+audit.  Comparisons below are within that same dump.
+
+| OOF evidence | Selected PCK | Baseline PCK | Rescued | Harmed | Net |
+|---|---:|---:|---:|---:|---:|
+| FLUX candidate fields + RoMa candidate fields | 68.46 | 69.10 | 252 | 269 | -17 |
+| FLUX + RoMa + DINO candidate fields | 68.34 | 69.10 | 249 | 269 | -20 |
+
+The FLUX+RoMa fold deltas are `-12`, `+21`, and `-26` correct points.  This is
+not stable evidence for a cross-pair rule, and DINO makes it slightly worse.
+It rejects another tempting shortcut: supervised calibration of the *existing
+scalar* RoMa/FLUX/DINO candidate evidence is not enough to reach a safe
+candidate router.  It does not reject RoMa feature injection, whose full-SPair
+global-representation gain is measured separately above.
 
 ## Research decision
 

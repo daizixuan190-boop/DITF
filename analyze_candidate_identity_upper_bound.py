@@ -28,6 +28,40 @@ def _read(path: str) -> dict[str, Any]:
     return payload
 
 
+def _records(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    """Normalize the two saved audit layouts to point-level records.
+
+    Candidate dumps use a flat ``records`` list, while the RoMa/DINO audit
+    writers preserve pair metadata in ``pair_records`` and nest points under
+    each pair.  The offline upper-bound audit must join them by pair/keypoint
+    identity without changing either producer's schema.
+    """
+
+    flat = payload.get("records")
+    if isinstance(flat, list):
+        return [row for row in flat if isinstance(row, dict)]
+    pair_records = payload.get("pair_records")
+    if not isinstance(pair_records, list):
+        return []
+    normalized: list[dict[str, Any]] = []
+    for pair in pair_records:
+        if not isinstance(pair, dict):
+            continue
+        pair_fields = {
+            name: pair[name]
+            for name in ("category", "pair_json", "src_image", "trg_image")
+            if name in pair
+        }
+        points = pair.get("points")
+        if not isinstance(points, list):
+            continue
+        for point in points:
+            if not isinstance(point, dict):
+                continue
+            normalized.append({**pair_fields, **point})
+    return normalized
+
+
 def _record_key(record: dict[str, Any]) -> tuple[str, int]:
     return str(record.get("pair_json", "")), int(record.get("keypoint_index", -1))
 
@@ -59,6 +93,17 @@ def _candidate_features(candidate: dict[str, Any], prefix: str) -> dict[str, flo
             number = _finite(value)
             if number is not None:
                 features[f"{prefix}:{name}"] = number
+    # RoMa/DINO candidate audits store their evidence directly on the
+    # candidate rather than beneath a scores dictionary.  Keep only numeric
+    # inference fields; PCK hit is an offline label and must never enter X.
+    for name, value in candidate.items():
+        if name in {"pck_hit", "pixel", "pixel_index", "scores", "metrics"}:
+            continue
+        if isinstance(value, bool):
+            continue
+        number = _finite(value)
+        if number is not None:
+            features[f"{prefix}:{name}"] = number
     return features
 
 
@@ -66,11 +111,22 @@ def _auxiliary_maps(paths: list[str]) -> dict[tuple[str, int], dict[tuple[int, i
     merged: dict[tuple[str, int], dict[tuple[int, int], dict[str, float]]] = {}
     for path in paths:
         payload = _read(path)
-        for record in payload.get("records", []):
+        source_name = str(payload.get("matcher", Path(path).stem))
+        for record in _records(payload):
             if not isinstance(record, dict):
                 continue
             key = _record_key(record)
             by_pixel = merged.setdefault(key, {})
+            direct_candidates = record.get("candidates")
+            if isinstance(direct_candidates, list):
+                for candidate in direct_candidates:
+                    if not isinstance(candidate, dict):
+                        continue
+                    pixel = _pixel_key(candidate.get("pixel"))
+                    if pixel is not None:
+                        by_pixel.setdefault(pixel, {}).update(
+                            _candidate_features(candidate, source_name)
+                        )
             for field, value in record.items():
                 if not isinstance(value, dict) or not isinstance(value.get("candidates"), list):
                     continue
@@ -106,7 +162,7 @@ def _matrix(payload: dict[str, Any], auxiliary: dict[tuple[str, int], dict[tuple
     groups: list[str] = []
     point_keys: list[tuple[str, int]] = []
     feature_names: set[str] = set()
-    for record in payload.get("records", []):
+    for record in _records(payload):
         if not isinstance(record, dict):
             continue
         point_key = _record_key(record)
@@ -205,7 +261,7 @@ def analyze(
     return {
         "diagnostic": "grouped supervised upper bound over existing candidate evidence",
         "label_contract": "PCK labels are used only for offline falsification; this is not a proposed training method",
-        "records": len(payload.get("records", [])),
+        "records": len(_records(payload)),
         "candidate_rows": len(rows),
         "feature_count": len(names),
         "features": names,
