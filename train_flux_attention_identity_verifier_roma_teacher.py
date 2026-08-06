@@ -83,6 +83,29 @@ def _reset_residual_head(model: CandidateIdentityVerifier) -> None:
     nn.init.zeros_(model.residual_head.bias)
 
 
+def _candidate_pixel_indices_to_points(
+    candidate_pixels: torch.Tensor,
+    target_size: Sequence[int],
+) -> torch.Tensor:
+    """Convert the existing flat pixel-index candidate contract to xy points."""
+
+    if candidate_pixels.ndim != 2:
+        raise ValueError("candidate pixel indices must be [query,candidate]")
+    target_h, target_w = map(int, target_size)
+    if target_h <= 0 or target_w <= 0:
+        raise ValueError("target size must be positive")
+    pixels = candidate_pixels.long()
+    if bool((pixels < 0).any()) or bool((pixels >= target_h * target_w).any()):
+        raise ValueError("candidate pixel index is outside target image")
+    return torch.stack(
+        (
+            pixels.remainder(target_w).float(),
+            torch.div(pixels, target_w, rounding_mode="floor").float(),
+        ),
+        dim=-1,
+    )
+
+
 def _direction_loss(
     model: CandidateIdentityVerifier,
     batch: Mapping[str, Any],
@@ -101,7 +124,9 @@ def _direction_loss(
     from eval_spair_attention_top20_roma_identity import _as_unbatched_warp
 
     warp, certainty = _as_unbatched_warp(warp, certainty)
-    candidates = batch["candidate_pixels"]
+    candidates = _candidate_pixel_indices_to_points(
+        batch["candidate_pixels"], target_size
+    )
     ranking = rank_attention_candidates_with_roma(
         source_points,
         candidates,

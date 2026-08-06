@@ -1,6 +1,18 @@
 import torch
 
-from train_flux_attention_identity_verifier_roma_teacher import roma_soft_targets
+from train_flux_attention_identity_verifier_roma_teacher import (
+    _candidate_pixel_indices_to_points,
+    roma_soft_targets,
+)
+
+
+def test_candidate_pixel_indices_are_converted_to_xy_points():
+    pixels = torch.tensor([[0, 5, 11], [3, 8, 10]])
+    points = _candidate_pixel_indices_to_points(pixels, (3, 4))
+    assert points.tolist() == [
+        [[0.0, 0.0], [1.0, 1.0], [3.0, 2.0]],
+        [[3.0, 0.0], [0.0, 2.0], [2.0, 2.0]],
+    ]
 
 
 def test_roma_soft_targets_follow_bidirectional_error_and_gate_confidence():
