@@ -269,7 +269,9 @@ def train(args: argparse.Namespace, device: torch.device) -> dict[str, Any]:
         seed=int(args.seed),
         max_pairs=int(args.max_train_pairs),
     )
-    captions = json.loads(Path(args.captions_json).read_text(encoding="utf-8"))
+    training_caption = str(args.training_caption).strip()
+    if not training_caption:
+        raise ValueError("--training_caption must be non-empty")
     categories = sorted({pair.category for pair in pairs})
     args.device = str(device)
     featurizer, flux_model, blocks = _load_flux_fjsar_runtime(args, categories)
@@ -294,15 +296,11 @@ def train(args: argparse.Namespace, device: torch.device) -> dict[str, Any]:
                 maximum=int(args.max_keypoints_per_pair),
                 seed=point_seed,
             )
-            source_caption_key = pair.category + pair.source_name
-            target_caption_key = pair.category + pair.target_name
-            if source_caption_key not in captions or target_caption_key not in captions:
-                raise KeyError(f"missing detailed caption for {pair.pair_name}")
             source_entry = _extract_flux_fjsar_entry(
                 args.dataset_path,
                 pair.category,
                 pair.source_name,
-                captions[source_caption_key],
+                training_caption,
                 args,
                 featurizer,
                 capture,
@@ -311,7 +309,7 @@ def train(args: argparse.Namespace, device: torch.device) -> dict[str, Any]:
                 args.dataset_path,
                 pair.category,
                 pair.target_name,
-                captions[target_caption_key],
+                training_caption,
                 args,
                 featurizer,
                 capture,
@@ -439,9 +437,13 @@ def train(args: argparse.Namespace, device: torch.device) -> dict[str, Any]:
         "pose_labels_used": False,
         "category_labels_used_for_targets": False,
         "keypoint_ids_used": False,
-        "category_names_used_for_file_routing_and_frozen_flux_caption_lookup_only": True,
-        "caption_labels_used": True,
-        "caption_policy": "existing_per_image_detailed_captions_matching_evaluation",
+        "category_names_used_for_file_routing_only": True,
+        "caption_labels_used": False,
+        "caption_policy": "one_fixed_neutral_prompt_for_all_training_images",
+        "training_caption": training_caption,
+        "training_caption_sha256": hashlib.sha256(
+            training_caption.encode("utf-8")
+        ).hexdigest(),
         "external_matcher_used": False,
         "dino_used": False,
         "roma_used": False,
@@ -504,7 +506,11 @@ def train(args: argparse.Namespace, device: torch.device) -> dict[str, Any]:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dataset_path", required=True)
-    parser.add_argument("--captions_json", default="spair_detailed_captions.json")
+    parser.add_argument(
+        "--training_caption",
+        default="a photo",
+        help="One fixed neutral prompt for every training image; no per-image captions are read.",
+    )
     parser.add_argument("--output_checkpoint", required=True)
     parser.add_argument("--output_summary", default="")
     parser.add_argument("--device", choices=("cuda", "cpu"), default="cuda")

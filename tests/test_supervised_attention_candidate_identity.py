@@ -7,6 +7,7 @@ from eval_spair_supervised_attention_candidate_identity import (
     summarize_supervised_records,
     validate_supervised_checkpoint_metadata,
 )
+from train_flux_attention_candidate_identity_supervised import build_parser as build_training_parser
 
 
 def _metadata():
@@ -66,6 +67,15 @@ def test_supervised_checkpoint_protocol_rejects_candidate_pool_mismatch():
     args.candidate_topk = 19
     with pytest.raises(ValueError, match="protocol mismatch"):
         validate_supervised_checkpoint_metadata({"training_metadata": _metadata()}, args)
+
+
+def test_supervised_training_uses_one_neutral_caption_not_caption_json():
+    args = build_training_parser().parse_args([
+        "--dataset_path", "/dataset",
+        "--output_checkpoint", "decoder.pt",
+    ])
+    assert args.training_caption == "a photo"
+    assert not hasattr(args, "captions_json")
 
 
 def test_candidate_kind_maps_only_appended_rank_to_baseline_fallback():

@@ -31,6 +31,7 @@ Decoder:
 - uses cross-candidate and cross-query context;
 - receives no category name or keypoint identity;
 - uses no DINO and no RoMa;
+- extracts every training image with the same neutral prompt, `a photo`;
 - ground truth never enters candidate feature construction or inference.
 
 Supervision is deliberately diagnostic, not label-free: only SPair `trn`
