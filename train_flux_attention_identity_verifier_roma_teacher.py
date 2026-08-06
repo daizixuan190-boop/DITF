@@ -268,6 +268,7 @@ def train(args: argparse.Namespace, device: torch.device) -> dict[str, Any]:
         "segmentation_masks_used": False,
         "pose_labels_used": False,
         "category_labels_used_for_targets": False,
+        "caption_labels_used": False,
         "training_pair_membership_used": True,
         "base_checkpoint": str(args.base_checkpoint),
         "base_checkpoint_sha256": hashlib.sha256(Path(args.base_checkpoint).read_bytes()).hexdigest(),
