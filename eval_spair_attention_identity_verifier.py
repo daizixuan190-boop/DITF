@@ -220,7 +220,15 @@ def _validate_checkpoint_metadata(
         "dino_used",
         "roma_used",
     )
-    enabled = [name for name in forbidden_flags if bool(metadata.get(name, True))]
+    allow_external_teacher = bool(
+        args is not None and getattr(args, "allow_external_teacher_checkpoint", False)
+    )
+    enabled = [
+        name
+        for name in forbidden_flags
+        if bool(metadata.get(name, True))
+        and not (allow_external_teacher and name in {"external_matcher_used", "dino_used", "roma_used"})
+    ]
     if enabled:
         raise ValueError(f"checkpoint violates label-free verifier protocol: {enabled}")
     if args is None:
@@ -578,6 +586,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max_pairs_per_cat", type=int, default=0)
     parser.add_argument("--candidate_topk", type=int, default=20)
     parser.add_argument("--extract_native_in_memory", action="store_true", default=False)
+    parser.add_argument(
+        "--allow_external_teacher_checkpoint",
+        action="store_true",
+        default=False,
+        help="Diagnostic-only: permit a checkpoint trained with an external RoMa/DINO teacher.",
+    )
     parser.add_argument("--fjsar_shared_noise", action="store_true", default=True)
     parser.add_argument("--fjsar_disk_cache_path", default="")
     parser.add_argument("--fjsar_require_disk_cache", action="store_true", default=False)
