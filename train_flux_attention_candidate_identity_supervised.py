@@ -224,6 +224,7 @@ def _training_summary(
     oracle = float(counts.get("pool_oracle_correct", 0.0))
     gap = max(0.0, oracle - baseline)
     return {
+        "measurement_timing": "online_pre_update_predictions_aggregated_during_single_pass",
         "optimization_steps": len(losses),
         "mean_loss": float(sum(losses) / max(1, len(losses))),
         "mean_gradient_norm": float(sum(gradient_norms) / max(1, len(gradient_norms))),

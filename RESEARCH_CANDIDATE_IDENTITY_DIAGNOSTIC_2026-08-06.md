@@ -65,10 +65,13 @@ Summaries report:
 - If training PCK rises but held-out pair20 does not, the decoder memorizes
   dataset/category regularities; inspect category failures and score margins
   before changing the architecture.
-- If even training cannot recover a material fraction of the pool Oracle gap,
-  the present candidate features are insufficient. Use the saved failure
-  records to identify the missing factor (symmetry, occlusion, viewpoint, or
-  part structure) rather than tuning gates.
+- The training JSON reports online pre-update predictions, loss, and gradient
+  norms; it is an optimization-health trace, not a final training-set capacity
+  score. Capacity decisions must use the held-out pair20 evaluation.
+- If held-out evaluation cannot recover a material fraction of the pool Oracle
+  gap despite healthy optimization, use the saved failure records to identify
+  the missing factor (symmetry, occlusion, viewpoint, or part structure)
+  rather than tuning gates.
 - A result below 75 is still conclusive only when pool Oracle remains high and
   training optimization is healthy; otherwise first diagnose candidate recall
   or optimization from the recorded recoverability, loss, and gradient norms.
