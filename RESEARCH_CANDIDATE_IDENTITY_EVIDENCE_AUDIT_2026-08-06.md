@@ -191,6 +191,19 @@ scalar* RoMa/FLUX/DINO candidate evidence is not enough to reach a safe
 candidate router.  It does not reject RoMa feature injection, whose full-SPair
 global-representation gain is measured separately above.
 
+### Existing RoMa soft-target distillation is not a new route
+
+The previously run `fjsar_roma_teacher_smoke16_seed2027` did not use RoMa
+top-1 hard labels.  Its metadata verifies `frozen_RoMa_bidirectional_warp_soft_candidate_targets`, a confidence mask, bidirectional directions, and a
+baseline-retention loss.  Across 16 pairs and 1,024 sampled queries it
+accepted only 179 confident teacher distributions (17.48% coverage).  The
+resulting verifier reaches 60.42 PCK on discovery20, versus 68.76 baseline.
+
+Therefore "replace hard pseudo-labels with RoMa soft targets" is already
+tested and rejected in its current warp-error / existing-verifier form.  A
+future method would need a different information representation, not this
+loss with more epochs or pairs.
+
 ## Research decision
 
 Do not run full supervised candidate-decoder training, anchor transport, or
