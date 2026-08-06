@@ -204,6 +204,33 @@ tested and rejected in its current warp-error / existing-verifier form.  A
 future method would need a different information representation, not this
 loss with more epochs or pairs.
 
+### RoMa teacher-quality audit: the prior confidence rule discarded usable supervision
+
+A follow-up CPU-only audit reads the already saved RoMa candidate rankings on
+discovery20 and heldout20.  It fixes three normalized bidirectional endpoint
+error tolerances (`0.05`, `0.10`, `0.20`) before inspecting PCK; these are
+geometric displacement units, not PCK-selected gates.  The discovery-derived
+confidence quantiles are transferred unchanged to heldout as a separate
+check.
+
+The only stable high-quality teacher signal is *small absolute bidirectional
+warp error*.  On heldout20:
+
+| Max normalized bidirectional error | Coverage | RoMa top-1 PCK | Baseline PCK in same subset | RoMa rescues / harms |
+|---|---:|---:|---:|---:|
+| 0.05 | 35.58% | 89.05% | 85.76% | 72 / 41 |
+| 0.10 | 55.43% | 80.29% | 78.17% | 151 / 120 |
+| 0.20 | 69.98% | 73.91% | 73.69% | 206 / 202 |
+
+For comparison, the previous 16-pair distillation used relative row-softmax
+probability plus certainty, accepting 17.48% of queries.  Mutual certainty
+and source certainty do *not* show the same stable heldout precision.  Thus
+the previous failure does not license a blind scale-up, but it does identify a
+specific corrected teacher contract worth testing: cache more unlabeled pairs
+once, supervise only with RoMa distributions whose absolute normalized
+bidirectional error is within a fixed geometric tolerance, and leave all
+other queries as baseline-preservation examples.
+
 ### A training-only third-image attention cycle is also rejected
 
 `train_flux_attention_identity_verifier_triangle_cycle.py` already used
