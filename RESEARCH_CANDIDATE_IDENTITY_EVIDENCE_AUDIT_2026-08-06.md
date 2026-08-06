@@ -204,6 +204,16 @@ tested and rejected in its current warp-error / existing-verifier form.  A
 future method would need a different information representation, not this
 loss with more epochs or pairs.
 
+### A training-only third-image attention cycle is also rejected
+
+`train_flux_attention_identity_verifier_triangle_cycle.py` already used
+unlabelled A--B--C paths from the SPair training pair graph.  A candidate in B
+was accepted only when frozen B--C--A attention returned uniquely to the
+source cell; the third image was removed at inference.  Its discovery20
+verifier obtained 62.71 PCK, below the 68.76 baseline.  This rejects the
+specific "third image as a frozen attention-cycle pseudo-label teacher" path.
+It must not be restated as a new multi-image solution.
+
 ## Research decision
 
 Do not run full supervised candidate-decoder training, anchor transport, or
