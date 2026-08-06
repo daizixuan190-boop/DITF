@@ -1,0 +1,4 @@
+__pycache__/
+*.py[cod]
+tmp/pdfs/**/*.pdf
+tmp/pdfs/**/*.png
