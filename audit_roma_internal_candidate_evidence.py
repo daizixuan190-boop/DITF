@@ -164,6 +164,7 @@ def _load_roma_scale16_fields(
     source_path: Path,
     target_path: Path,
     device: torch.device,
+    amp_dtype: torch.dtype,
 ) -> dict[str, torch.Tensor]:
     """Run the official RoMa encoder and scale-16 GP exactly once per pair."""
 
@@ -189,7 +190,16 @@ def _load_roma_scale16_fields(
         # corresponding string key (``proj["16"]``).
         if 16 not in pyramid or int(pyramid[16].shape[0]) != 2:
             raise RuntimeError("official RoMa encoder did not return a two-image scale-16 pyramid")
-        projected = model.decoder.proj["16"](pyramid[16])
+        # This is the same precision boundary as Decoder.forward in the
+        # pinned RoMa release: the projection is autocast, while GP.forward
+        # promotes feature kernels to float32 before its matrix inversion.
+        with torch.autocast(
+            device_type=device.type,
+            dtype=amp_dtype,
+            enabled=device.type == "cuda" and amp_dtype != torch.float32,
+        ):
+            projected = model.decoder.proj["16"](pyramid[16])
+        projected = projected.float()
         reverse_projected = torch.cat(
             (projected.chunk(2)[1], projected.chunk(2)[0]), dim=0
         )
@@ -269,6 +279,11 @@ def _parse_args() -> argparse.Namespace:
 def main() -> None:
     args = _parse_args()
     device = torch.device(args.device)
+    amp_dtype = {
+        "fp16": torch.float16,
+        "bf16": torch.bfloat16,
+        "fp32": torch.float32,
+    }[args.roma_precision]
     payload = json.loads(Path(args.attention_audit_json).read_text(encoding="utf-8"))
     source_records = _validate_audit(payload)
     model = _build_roma(args, device)
@@ -299,7 +314,9 @@ def main() -> None:
             device=device,
             dtype=torch.float32,
         )
-        fields = _load_roma_scale16_fields(model, source_path, target_path, device)
+        fields = _load_roma_scale16_fields(
+            model, source_path, target_path, device, amp_dtype
+        )
         scores = rank_roma_internal_candidates(
             source_points, candidate_points, source_size, target_size, **fields
         )
