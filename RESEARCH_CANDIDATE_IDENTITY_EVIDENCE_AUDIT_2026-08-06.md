@@ -262,3 +262,29 @@ candidate-conditioned relation representation* rather than another scalar:
 
 The source of such a relation is deliberately undecided by this audit.  The
 evidence establishes the information contract, not a premature architecture.
+
+### Pending falsification: RoMa pre-warp GP candidate evidence
+
+`audit_roma_internal_candidate_evidence.py` is the smallest direct test of
+the still-unanswered RoMa question.  The earlier RoMa experiments reduce the
+frozen matcher to a final dense warp, its bidirectional endpoint error, and
+certainty.  The official RoMa implementation contains an earlier scale-16
+Gaussian-process (GP) posterior: projected source/target features condition a
+prediction of the opposite image's learned Fourier position basis before the
+coordinate decoder and multi-scale warp refiners.
+
+The audit keeps the exact existing FLUX mutual-attention top-20 coordinates
+fixed.  It records (i) a RoMa encoder-cosine control and (ii) symmetric GP
+posterior-to-opposite-position-basis agreement for every source-query and
+candidate pair.  It does not use warp error, certainty, DiTF, DINO, attention
+score, a native fallback, training, or a learned fusion.  PCK is inspected
+only after the fixed candidate order is created.
+
+The question is intentionally narrow: does this pre-warp, pair-conditioned
+representation improve true-candidate rank specifically on `oracle_gap` and
+`both_wrong_top20_hit` points, including points on which the existing RoMa
+coordinate rule is wrong?  The exact discovery construction must then be
+repeated unchanged on heldout20.  If it fails to give a stable held-out rank
+lift in that residual, RoMa's presently accessible internal representation is
+not evidence for another injection or distillation project and that route is
+closed rather than tuned.
