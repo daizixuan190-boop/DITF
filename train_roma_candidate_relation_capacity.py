@@ -189,22 +189,79 @@ def _extract_split(
     return data
 
 
-def _current_lookup(path: str | None) -> dict[tuple[str, str, int, tuple[float, float], tuple[float, float]], bool]:
+CurrentKey = tuple[str, str, int]
+CurrentEntry = tuple[tuple[float, float], tuple[float, float], bool]
+
+
+def _current_lookup(path: str | None) -> dict[CurrentKey, CurrentEntry]:
     if not path:
         return {}
     payload = json.loads(Path(path).read_text(encoding="utf-8"))
     rows = payload.get("pair_records")
     if not isinstance(rows, list):
         raise ValueError("current audit must contain pair_records")
-    result = {}
+    result: dict[CurrentKey, CurrentEntry] = {}
     for pair in rows:
         for point in pair["points"]:
-            key = (
+            key: CurrentKey = (
                 str(pair["category"]), str(pair.get("pair_json", "")), int(point["keypoint_index"]),
-                tuple(float(value) for value in point["source_point"]), tuple(float(value) for value in point["target_point"]),
             )
-            result[key] = bool(point["method_pck_hit"])
+            if key in result:
+                raise RuntimeError(f"current audit contains duplicate pair/keypoint record: {key}")
+            result[key] = (
+                tuple(float(value) for value in point["source_point"]),
+                tuple(float(value) for value in point["target_point"]),
+                bool(point["method_pck_hit"]),
+            )
     return result
+
+
+def align_current_identities(
+    identities: Sequence[tuple[str, str, int, tuple[float, float], tuple[float, float]]],
+    current: Mapping[CurrentKey, CurrentEntry],
+    *,
+    tolerance: float = 1e-4,
+) -> torch.Tensor:
+    """Join only on pair/keypoint, then strictly validate both endpoint coordinates.
+
+    Exact float equality is not a valid JSON cross-artifact contract.  This
+    accepts harmless serialization differences while rejecting a stale audit,
+    coordinate-system mismatch, or missing point instead of silently treating
+    every unmatched row as a current error.
+    """
+
+    if tolerance < 0.0:
+        raise ValueError("alignment tolerance must be non-negative")
+    values: list[bool] = []
+    missing: list[CurrentKey] = []
+    mismatches: list[tuple[CurrentKey, float, float]] = []
+    for category, pair_json, index, source, target in identities:
+        key: CurrentKey = (category, pair_json, index)
+        entry = current.get(key)
+        if entry is None:
+            missing.append(key)
+            continue
+        current_source, current_target, current_hit = entry
+        source_error = max(abs(a - b) for a, b in zip(source, current_source))
+        target_error = max(abs(a - b) for a, b in zip(target, current_target))
+        if source_error > tolerance or target_error > tolerance:
+            mismatches.append((key, source_error, target_error))
+            continue
+        values.append(current_hit)
+    if missing or mismatches:
+        fragments = []
+        if missing:
+            fragments.append(f"missing={len(missing)} first={missing[0]}")
+        if mismatches:
+            key, source_error, target_error = mismatches[0]
+            fragments.append(
+                f"coordinate_mismatch={len(mismatches)} first={key} "
+                f"source_error={source_error:.6g} target_error={target_error:.6g}"
+            )
+        raise RuntimeError("current audit does not strictly align with eval audit: " + "; ".join(fragments))
+    if len(values) != len(identities):  # pragma: no cover - guarded above.
+        raise RuntimeError("current audit alignment lost evaluation records")
+    return torch.tensor(values, dtype=torch.bool)
 
 
 def _train_head(data: Mapping[str, Any], *, device: torch.device, epochs: int, batch_queries: int, seed: int) -> CandidateConditionedRelationHead:
@@ -242,13 +299,14 @@ def _evaluate(head: CandidateConditionedRelationHead, data: Mapping[str, Any], c
         "teacher_agreement": float(predicted.eq(data["teacher_labels"]).float().mean()),
     }
     if current:
-        current_hits = torch.tensor([bool(current.get(key, False)) for key in data["identities"]], dtype=torch.bool)
+        current_hits = align_current_identities(data["identities"], current)
         residual = ~current_hits
         routeable = residual & data["candidate_hits"].any(dim=1)
         result["strict_current_residual"] = {
             "queries": int(routeable.sum()),
             "relation_top1": float(hits[routeable].float().mean()) if bool(routeable.any()) else None,
             "fixed_teacher_top1": float(teacher_hits[routeable].float().mean()) if bool(routeable.any()) else None,
+            "alignment": "pair_json + keypoint_index with source/target coordinate tolerance <= 1e-4",
         }
     return result
 
