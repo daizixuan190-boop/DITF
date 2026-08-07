@@ -28,6 +28,22 @@ def pair_relation_block(source: torch.Tensor, candidate: torch.Tensor) -> torch.
     return torch.cat((expanded, candidate, expanded * candidate, (expanded - candidate).abs()), dim=-1)
 
 
+def multi_positive_listwise_loss(logits: torch.Tensor, positive_mask: torch.Tensor) -> torch.Tensor:
+    """Negative log probability mass assigned to any PCK-valid candidate.
+
+    This is deliberately different from single-index cross entropy: SPair PCK
+    can accept several proposals in the same attention top-20 pool.
+    """
+
+    if logits.ndim != 2 or positive_mask.shape != logits.shape:
+        raise ValueError("logits and positive_mask must both be [P,K]")
+    positive_mask = positive_mask.to(device=logits.device, dtype=torch.bool)
+    if not bool(positive_mask.any(dim=1).all()):
+        raise ValueError("each query must contain at least one positive candidate")
+    positive_logits = logits.masked_fill(~positive_mask, float("-inf"))
+    return (torch.logsumexp(logits, dim=1) - torch.logsumexp(positive_logits, dim=1)).mean()
+
+
 class CandidateConditionedRelationHead(nn.Module):
     """Small set-aware head; candidates are never collapsed to a scalar input."""
 
